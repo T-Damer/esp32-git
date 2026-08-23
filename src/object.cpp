@@ -1,37 +1,14 @@
 #include "esp32_git.h"
 
-#include <sys/stat.h>
-
 #include <cstdio>
 #include <cstring>
 #include <new>
 
+#include "io.h"
 #include "sha1.h"
 #include "zlib.h"
 
 namespace {
-
-// ponytail: stdio + POSIX mkdir on host for now; the ESP32 build swaps this
-// file layer for HalStorage-backed calls behind the same signatures.
-int write_file(const char *path, const uint8_t *data, size_t len) {
-  FILE *f = fopen(path, "wb");
-  if (!f) return -1;
-  const size_t wrote = fwrite(data, 1, len, f);
-  fclose(f);
-  return wrote == len ? 0 : -1;
-}
-
-// Reads the whole file; returns 0 and sets *len, -1 if missing or larger than cap.
-int read_file(const char *path, uint8_t *data, size_t cap, size_t *len) {
-  FILE *f = fopen(path, "rb");
-  if (!f) return -1;
-  const size_t got = fread(data, 1, cap, f);
-  const bool at_eof = (fgetc(f) == EOF);
-  fclose(f);
-  if (!at_eof) return -1;
-  *len = got;
-  return 0;
-}
 
 void hex_digest(const uint8_t digest[20], char out[41]) {
   static const char kHex[] = "0123456789abcdef";
@@ -47,11 +24,10 @@ void hex_digest(const uint8_t digest[20], char out[41]) {
 int esp32git_object_path(const char *repo_path, const char *sha, char *out,
                          size_t cap) {
   if (!repo_path || !sha || strlen(sha) != 40) return 0;
-  struct stat st;
   snprintf(out, cap, "%s/.git/objects/%c%c/%s", repo_path, sha[0], sha[1], sha + 2);
-  if (stat(out, &st) == 0 && S_ISREG(st.st_mode)) return 1;
+  if (e32g::exists(out)) return 1;
   snprintf(out, cap, "%s/objects/%c%c/%s", repo_path, sha[0], sha[1], sha + 2);
-  if (stat(out, &st) == 0 && S_ISREG(st.st_mode)) return 1;
+  if (e32g::exists(out)) return 1;
   // Neither layout has it yet: report the checkout-style path for writers.
   snprintf(out, cap, "%s/.git/objects/%c%c/%s", repo_path, sha[0], sha[1], sha + 2);
   return 0;
@@ -100,11 +76,11 @@ esp32git_status esp32git_object_write(const char *repo_path, const char *type,
 
   char dir[512];
   snprintf(dir, sizeof(dir), "%s/.git/objects/%c%c", repo_path, out_sha[0], out_sha[1]);
-  mkdir(dir, 0777); // exists_ok
+  e32g::make_dirs(dir); // exists-ok
 
   char path[576];
   snprintf(path, sizeof(path), "%s/%s", dir, out_sha + 2);
-  if (write_file(path, compressed, (size_t)compressed_len) != 0) {
+  if (!e32g::write_whole(path, compressed, (size_t)compressed_len)) {
     delete[] compressed;
     return ESP32GIT_IO_ERROR;
   }
@@ -122,25 +98,12 @@ esp32git_status esp32git_object_read(const char *repo_path, const char *sha,
     return ESP32GIT_INVALID_REF; // object does not exist in either layout
   }
 
-  // Size the file first so one read suffices.
-  FILE *f = fopen(path, "rb");
-  if (!f) return ESP32GIT_INVALID_REF; // object does not exist
-  fseek(f, 0, SEEK_END);
-  const long file_size = ftell(f);
-  fclose(f);
-  if (file_size <= 0) return ESP32GIT_IO_ERROR;
-
-  uint8_t *compressed = new (std::nothrow) uint8_t[(size_t)file_size];
-  if (!compressed) return ESP32GIT_OUT_OF_MEMORY;
-  size_t stored_len = 0;
-  if (read_file(path, compressed, (size_t)file_size, &stored_len) != 0) {
-    delete[] compressed;
-    return ESP32GIT_IO_ERROR;
-  }
+  std::vector<uint8_t> compressed;
+  if (!e32g::read_whole(path, compressed)) return ESP32GIT_IO_ERROR;
 
   // Inflate into caller's buffer; require room for the header too.
-  const long raw_len = esp32git_zlib_inflate(compressed, stored_len, (uint8_t *)out, out_cap);
-  delete[] compressed;
+  const long raw_len =
+      esp32git_zlib_inflate(compressed.data(), compressed.size(), (uint8_t *)out, out_cap);
   if (raw_len < 0) return ESP32GIT_PROTOCOL_ERROR;
 
   // Parse "<type> <size>\0".

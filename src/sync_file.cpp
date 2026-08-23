@@ -1,7 +1,5 @@
 #include "esp32_git.h"
 
-#include <sys/stat.h>
-
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -9,6 +7,7 @@
 
 #include "hexutil.h"
 #include "history.h"
+#include "io.h"
 #include "repo.h"
 
 namespace {
@@ -20,54 +19,33 @@ std::string object_path(const char *repo, const char *sha) {
   const std::string sub = std::string(sha).substr(0, 2);
   const std::string rest = std::string(sha).substr(2);
   const std::string nested = std::string(repo) + "/.git/objects/" + sub + "/" + rest;
-  struct stat st;
-  if (stat(nested.c_str(), &st) != 0) {
-    const std::string flat = std::string(repo) + "/objects/" + sub + "/" + rest;
-    return flat;
+  if (!e32g::exists(nested)) {
+    return std::string(repo) + "/objects/" + sub + "/" + rest;
   }
   return nested;
 }
 
 bool object_exists(const char *repo, const char *sha) {
-  struct stat st;
-  return stat(object_path(repo, sha).c_str(), &st) == 0;
+  return e32g::exists(object_path(repo, sha));
 }
 
 // Copies a loose object file verbatim between repos (no decode needed).
 bool copy_object(const char *src_repo, const char *dst_repo, const char *sha) {
   if (object_exists(dst_repo, sha)) return true;
-  FILE *in = fopen(object_path(src_repo, sha).c_str(), "rb");
-  if (!in) return false;
-  fseek(in, 0, SEEK_END);
-  const long size = ftell(in);
-  fseek(in, 0, SEEK_SET);
-  std::vector<char> data((size_t)size);
-  fread(data.data(), 1, data.size(), in);
-  fclose(in);
+  std::vector<uint8_t> data;
+  if (!e32g::read_whole(object_path(src_repo, sha), data)) return false;
 
   const std::string sub = std::string(sha).substr(0, 2);
   const std::string rest = std::string(sha).substr(2);
-  std::string dst_dir = std::string(dst_repo) + "/.git/objects/" + sub;
-  { // bare destination?
-    struct stat st;
-    if (stat((std::string(dst_repo) + "/HEAD").c_str(), &st) == 0 &&
-        stat((std::string(dst_repo) + "/refs").c_str(), &st) == 0 &&
-        !object_path(dst_repo, "0000000000000000000000000000000000000000").empty()) {
-      dst_dir = std::string(dst_repo) + "/objects/" + sub;
-    }
-  }
-  std::string cur;
-  for (size_t i = 0; i <= dst_dir.size(); i++) {
-    if (i == dst_dir.size() || dst_dir[i] == '/') {
-      cur = dst_dir.substr(0, i);
-      if (!cur.empty()) mkdir(cur.c_str(), 0777);
-    }
-  }
-  FILE *out = fopen((dst_dir + "/" + rest).c_str(), "wb");
-  if (!out) return false;
-  fwrite(data.data(), 1, data.size(), out);
-  fclose(out);
-  return true;
+  // Bare destination keeps objects directly under <repo>/objects/...
+  const bool dst_is_bare =
+      e32g::exists(std::string(dst_repo) + "/HEAD") &&
+      !e32g::exists(std::string(dst_repo) + "/.git/HEAD");
+  const std::string base =
+      dst_is_bare ? std::string(dst_repo) : std::string(dst_repo) + "/.git";
+  const std::string dst_dir = base + "/objects/" + sub;
+  if (!e32g::make_dirs(dst_dir)) return false;
+  return e32g::write_whole(dst_dir + "/" + rest, data.data(), data.size());
 }
 
 // Copies every object reachable from a commit (commit -> tree -> subtrees ->
@@ -146,10 +124,7 @@ long copy_reachable(const char *from_repo, const char *head_sha,
 
 void ensure_parent_dirs(const std::string &path) {
   // Parents only - the final component is the file itself.
-  const size_t last = path.find_last_of('/');
-  for (size_t i = 1; i < last; i++) {
-    if (path[i] == '/') mkdir(path.substr(0, i).c_str(), 0777);
-  }
+  e32g::make_dirs(path.substr(0, path.find_last_of('/')));
 }
 
 // Materializes worktree files and the staging index from a tree id.
@@ -191,10 +166,7 @@ esp32git_status checkout_tree(const char *repo_path, const char *tree_sha) {
         }
         const std::string fp = std::string(repo_path) + "/" + relpath;
         ensure_parent_dirs(fp);
-        FILE *f = fopen(fp.c_str(), "wb");
-        if (!f) return ESP32GIT_IO_ERROR;
-        fwrite(content, 1, blen, f);
-        fclose(f);
+        if (!e32g::write_whole(fp, content, blen)) return ESP32GIT_IO_ERROR;
         index_entries.push_back({relpath, hex});
       }
       q = nul + 21;

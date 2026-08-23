@@ -6,32 +6,20 @@
 #include <algorithm>
 
 #include "history.h"
+#include "io.h"
 #include "sha1.h"
 
 namespace {
-
-bool ensure_dir(const std::string &path) {
-  // mkdir -p
-  std::string cur;
-  for (size_t i = 0; i <= path.size(); i++) {
-    if (i == path.size() || path[i] == '/') {
-      cur = path.substr(0, i);
-      if (!cur.empty()) mkdir(cur.c_str(), 0777);
-    }
-  }
-  struct stat st;
-  return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-}
 
 std::string git_dir(const char *repo_path) {
   return std::string(repo_path) + "/.git";
 }
 
 int read_text(const std::string &path, char *out, size_t cap) {
-  FILE *f = fopen(path.c_str(), "rb");
-  if (!f) return -1;
-  const size_t n = fread(out, 1, cap - 1, f);
-  fclose(f);
+  std::vector<uint8_t> data;
+  if (!e32g::read_whole(path, data)) return -1;
+  const size_t n = data.size() < cap - 1 ? data.size() : cap - 1;
+  memcpy(out, data.data(), n);
   out[n] = '\0';
   return 0;
 }
@@ -39,22 +27,22 @@ int read_text(const std::string &path, char *out, size_t cap) {
 } // namespace
 
 bool esp32git_is_repo_dir(const char *repo_path) {
-  struct stat st;
   const std::string g = git_dir(repo_path);
-  return stat((g + "/objects").c_str(), &st) == 0 && stat((g + "/HEAD").c_str(), &st) == 0;
+  return e32g::exists(g + "/HEAD");
 }
 
 esp32git_status esp32git_repo_init(const char *workdir) {
   if (!workdir) return ESP32GIT_IO_ERROR;
-  if (!ensure_dir(workdir)) return ESP32GIT_IO_ERROR;
+  if (!e32g::make_dirs(workdir)) return ESP32GIT_IO_ERROR;
   const std::string g = git_dir(workdir);
-  if (!ensure_dir(g + "/objects") || !ensure_dir(g + "/refs/heads")) {
+  if (!e32g::make_dirs(g + "/objects") || !e32g::make_dirs(g + "/refs/heads")) {
     return ESP32GIT_IO_ERROR;
   }
-  FILE *f = fopen((g + "/HEAD").c_str(), "wb");
-  if (!f) return ESP32GIT_IO_ERROR;
-  fputs("ref: refs/heads/main\n", f);
-  fclose(f);
+  const char head_content[] = "ref: refs/heads/main\n";
+  if (!e32g::write_whole(g + "/HEAD", (const uint8_t *)head_content,
+                         sizeof(head_content) - 1)) {
+    return ESP32GIT_IO_ERROR;
+  }
   return esp32git_index_save(workdir, {});
 }
 
@@ -82,23 +70,18 @@ esp32git_status esp32git_read_ref(const char *repo_path, const char *refname,
 esp32git_status esp32git_write_ref(const char *repo_path, const char *refname,
                                    const char *sha) {
   std::string full = git_dir(repo_path) + "/" + refname;
-  struct stat st;
   // Bare origin: write under <repo>/refs/... instead.
-  if (stat((std::string(repo_path) + "/refs").c_str(), &st) == 0 &&
-      stat((std::string(repo_path) + "/HEAD").c_str(), &st) == 0) {
-    FILE *probe = fopen(git_dir(repo_path).c_str(), "rb");
-    const bool not_a_dir = !probe;
-    if (probe) fclose(probe);
-    if (not_a_dir) full = std::string(repo_path) + "/" + refname;
+  if (!e32g::exists(git_dir(repo_path) + "/HEAD") &&
+      e32g::exists(std::string(repo_path) + "/HEAD")) {
+    full = std::string(repo_path) + "/" + refname;
   }
   const size_t slash = full.find_last_of('/');
   if (slash == std::string::npos) return ESP32GIT_IO_ERROR;
-  if (!ensure_dir(full.substr(0, slash))) return ESP32GIT_IO_ERROR;
-  FILE *f = fopen(full.c_str(), "wb");
-  if (!f) return ESP32GIT_IO_ERROR;
-  fprintf(f, "%s\n", sha);
-  fclose(f);
-  return ESP32GIT_OK;
+  if (!e32g::make_dirs(full.substr(0, slash))) return ESP32GIT_IO_ERROR;
+  const std::string content = std::string(sha) + "\n";
+  return e32g::write_whole(full, (const uint8_t *)content.data(), content.size())
+             ? ESP32GIT_OK
+             : ESP32GIT_IO_ERROR;
 }
 
 esp32git_status esp32git_resolve_head(const char *repo_path, char out_sha[41]) {
@@ -115,23 +98,21 @@ esp32git_status esp32git_resolve_head(const char *repo_path, char out_sha[41]) {
 
 esp32git_status esp32git_index_load(const char *repo_path,
                                     std::vector<esp32git_index_entry> *out) {
-  FILE *f = fopen((git_dir(repo_path) + "/esp32git-index").c_str(), "rb");
-  if (!f) { // no index yet = empty staging area
-    out->clear();
-    return ESP32GIT_OK;
-  }
-  char line[512];
   out->clear();
-  while (fgets(line, sizeof(line), f)) {
-    char sha[41];
-    if (sscanf(line, "%40s", sha) != 1) continue;
-    const char *path = line + 40;
-    while (*path == ' ') path++;
-    const size_t n = strlen(path);
-    if (n && path[n - 1] == '\n') ((char *)path)[n - 1] = '\0'; // const_cast ok: our buffer
-    if (*path) out->push_back({path, sha});
+  std::vector<uint8_t> data;
+  if (!e32g::read_whole(git_dir(repo_path) + "/esp32git-index", data)) {
+    return ESP32GIT_OK; // no index yet = empty staging area
   }
-  fclose(f);
+  std::string text(data.begin(), data.end());
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = text.find('\n', pos);
+    if (end == std::string::npos) end = text.size();
+    const std::string line = text.substr(pos, end - pos);
+    pos = end + 1;
+    if (line.size() < 42 || line[40] != ' ') continue;
+    out->push_back({line.substr(41), line.substr(0, 40)});
+  }
   std::sort(out->begin(), out->end(),
             [](const esp32git_index_entry &a, const esp32git_index_entry &b) {
               return a.path < b.path;
@@ -146,13 +127,17 @@ esp32git_status esp32git_index_save(const char *repo_path,
             [](const esp32git_index_entry &a, const esp32git_index_entry &b) {
               return a.path < b.path;
             });
-  FILE *f = fopen((git_dir(repo_path) + "/esp32git-index").c_str(), "wb");
-  if (!f) return ESP32GIT_IO_ERROR;
+  std::string blob;
   for (const auto &e : sorted) {
-    fprintf(f, "%s %s\n", e.sha.c_str(), e.path.c_str());
+    blob += e.sha;
+    blob += ' ';
+    blob += e.path;
+    blob += '\n';
   }
-  fclose(f);
-  return ESP32GIT_OK;
+  return e32g::write_whole(git_dir(repo_path) + "/esp32git-index",
+                           (const uint8_t *)blob.data(), blob.size())
+             ? ESP32GIT_OK
+             : ESP32GIT_IO_ERROR;
 }
 
 namespace {
@@ -178,29 +163,20 @@ void hash_only(const void *data, size_t len, char out[41]) {
 } // namespace
 
 esp32git_status esp32git_add(const char *repo_path, const char *relpath) {
-  std::vector<char> content;
-  {
-    const std::string fp = std::string(repo_path) + "/" + relpath;
-    FILE *f = fopen(fp.c_str(), "rb");
-    if (!f) { // deletion staged by adding a missing path
-      std::vector<esp32git_index_entry> idx;
-      esp32git_index_load(repo_path, &idx);
-      bool found = false;
-      for (auto &e : idx) {
-        if (e.path == relpath) {
-          e.sha = ""; // tombstone = staged deletion
-          found = true;
-        }
+  std::vector<uint8_t> content;
+  if (!e32g::read_whole(std::string(repo_path) + "/" + relpath, content)) {
+    // deletion staged by adding a missing path
+    std::vector<esp32git_index_entry> idx;
+    esp32git_index_load(repo_path, &idx);
+    bool found = false;
+    for (auto &e : idx) {
+      if (e.path == relpath) {
+        e.sha = ""; // tombstone = staged deletion
+        found = true;
       }
-      if (!found) return ESP32GIT_IO_ERROR;
-      return esp32git_index_save(repo_path, idx);
     }
-    fseek(f, 0, SEEK_END);
-    const long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    content.resize(size > 0 ? (size_t)size : 1);
-    fread(content.data(), 1, content.size(), f);
-    fclose(f);
+    if (!found) return ESP32GIT_IO_ERROR;
+    return esp32git_index_save(repo_path, idx);
   }
 
   char sha[41];
@@ -234,17 +210,10 @@ esp32git_status esp32git_status_file(const char *repo_path, const char *relpath,
   // Worktree state.
   char wt_sha[41] = "";
   {
-    const std::string fp = std::string(repo_path) + "/" + relpath;
-    FILE *f = fopen(fp.c_str(), "rb");
-    if (f) {
-      fseek(f, 0, SEEK_END);
-      const long size = ftell(f);
-      fseek(f, 0, SEEK_SET);
-      std::vector<char> data(size > 0 ? (size_t)size : 1);
-      fread(data.data(), 1, data.size(), f);
-      fclose(f);
+    std::vector<uint8_t> data;
+    if (e32g::read_whole(std::string(repo_path) + "/" + relpath, data)) {
       hash_only(data.data(), data.size(), wt_sha);
-    } // else: absent from worktree -> wt_sha stays ""
+    } // absent from worktree -> wt_sha stays ""
   }
 
   // HEAD state.
