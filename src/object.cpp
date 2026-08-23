@@ -44,6 +44,19 @@ void hex_digest(const uint8_t digest[20], char out[41]) {
 
 } // namespace
 
+int esp32git_object_path(const char *repo_path, const char *sha, char *out,
+                         size_t cap) {
+  if (!repo_path || !sha || strlen(sha) != 40) return 0;
+  struct stat st;
+  snprintf(out, cap, "%s/.git/objects/%c%c/%s", repo_path, sha[0], sha[1], sha + 2);
+  if (stat(out, &st) == 0 && S_ISREG(st.st_mode)) return 1;
+  snprintf(out, cap, "%s/objects/%c%c/%s", repo_path, sha[0], sha[1], sha + 2);
+  if (stat(out, &st) == 0 && S_ISREG(st.st_mode)) return 1;
+  // Neither layout has it yet: report the checkout-style path for writers.
+  snprintf(out, cap, "%s/.git/objects/%c%c/%s", repo_path, sha[0], sha[1], sha + 2);
+  return 0;
+}
+
 esp32git_status esp32git_object_write(const char *repo_path, const char *type,
                                       const void *payload, size_t len,
                                       char out_sha[41]) {
@@ -105,8 +118,9 @@ esp32git_status esp32git_object_read(const char *repo_path, const char *sha,
   if (!repo_path || !sha || strlen(sha) != 40) return ESP32GIT_INVALID_REF;
 
   char path[576];
-  snprintf(path, sizeof(path), "%s/.git/objects/%c%c/%s", repo_path, sha[0], sha[1],
-           sha + 2);
+  if (!esp32git_object_path(repo_path, sha, path, sizeof(path))) {
+    return ESP32GIT_INVALID_REF; // object does not exist in either layout
+  }
 
   // Size the file first so one read suffices.
   FILE *f = fopen(path, "rb");

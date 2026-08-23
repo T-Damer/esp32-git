@@ -1,10 +1,8 @@
 #pragma once
 
 // esp32-git: minimal git client for ESP32 + SD card.
-// Loose objects only; fast-forward-only push/pull; smart-HTTP transport.
-//
-// Pure C API so it links into ESP-IDF/Arduino builds unchanged; the
-// PlatformIO registration maps file I/O onto HalStorage later.
+// Loose objects only; fast-forward-only push/pull; file transport now,
+// smart-HTTP transport planned; verified against stock git.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -26,7 +24,7 @@ typedef enum {
 } esp32git_status;
 
 typedef struct {
-  const char *url;   // https://host/org/repo.git
+  const char *url;   // https://host/org/repo.git (HTTP transport, planned)
   const char *user;  // basic auth user (often a token name)
   const char *token; // basic auth password
 } esp32git_remote;
@@ -38,19 +36,51 @@ typedef struct {
 
 // ---- object model ---------------------------------------------------------
 
-// Hash and write a loose object under <repo_path>/.git/objects/xx/yyyy...
-// type is "blob", "tree", or "commit"; payload may be any bytes.
-// out_sha receives the 40-char lowercase hex object id.
 esp32git_status esp32git_object_write(const char *repo_path, const char *type,
                                       const void *payload, size_t len,
                                       char out_sha[41]);
 
-// Read a loose object by hex sha. out_type receives the stored type string.
-// Returns OK; INVALID_REF when the object does not exist; IO_ERROR on storage
-// failure; PROTOCOL_ERROR when the Adler-32 trailer fails validation.
 esp32git_status esp32git_object_read(const char *repo_path, const char *sha,
                                      char *out_type, size_t type_cap,
                                      void *out, size_t out_cap, size_t *out_len);
+
+// Loose-object file path for sha, accepting both layouts:
+// <repo>/.git/objects/xx/yyyy (checkout) and <repo>/objects/xx/yyyy (bare).
+// Returns false when the file exists at neither.
+int esp32git_object_path(const char *repo_path, const char *sha, char *out,
+                         size_t cap);
+
+// ---- repo lifecycle -------------------------------------------------------
+
+// Creates .git/ skeleton under workdir (objects, refs/heads, HEAD -> main).
+esp32git_status esp32git_init(const char *workdir);
+
+// Stages one worktree path (missing path stages its deletion).
+esp32git_status esp32git_add(const char *repo_path, const char *relpath);
+
+// Classifies a path: 'S' staged change, 'U' unstaged change,
+// '?' untracked, 'D' staged deletion, '=' clean.
+esp32git_status esp32git_status_file(const char *repo_path, const char *relpath,
+                                     char *out_state);
+
+// Writes tree + commit objects from the staged index and advances HEAD.
+esp32git_status esp32git_commit(const char *repo_path, const esp32git_identity *id,
+                                const char *message, char out_sha[41]);
+
+// ---- file-transport sync (remote is a plain directory with .git/) ---------
+
+// Fetches branch objects into repo_path and fast-forwards the local ref.
+// A diverged remote fails with REMOTE_DIVERGED; up-to-date returns UP_TO_DATE.
+esp32git_status esp32git_fetch(const char *remote_dir, const char *branch,
+                               const char *repo_path);
+
+// Pushes local HEAD's objects to remote branch; fast-forward only.
+esp32git_status esp32git_push(const char *remote_dir, const char *branch,
+                              const char *repo_path);
+
+// init + fetch + materialize the worktree and staging index at remote HEAD.
+esp32git_status esp32git_clone(const char *remote_dir, const char *branch,
+                               const char *workdir);
 
 #ifdef __cplusplus
 }

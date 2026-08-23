@@ -8,6 +8,9 @@ include(CTest)
 
 add_library(esp32git STATIC
   src/object.cpp
+  src/repo.cpp
+  src/history.cpp
+  src/sync_file.cpp
   src/sha1.c
   src/zlib.c
   third_party/uzlib/tinflate.c
@@ -21,4 +24,14 @@ add_executable(test_objects test/test_objects.c)
 target_link_libraries(test_objects PRIVATE esp32git)
 target_include_directories(test_objects PRIVATE src third_party/uzlib)
 
+add_executable(test_commit test/test_commit.c)
+target_link_libraries(test_commit PRIVATE esp32git)
+target_include_directories(test_commit PRIVATE src third_party/uzlib)
+
+add_executable(test_sync test/test_sync.c)
+target_link_libraries(test_sync PRIVATE esp32git)
+target_include_directories(test_sync PRIVATE src third_party/uzlib)
+
 add_test(NAME objects COMMAND test_objects WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME commit COMMAND test_commit WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME sync COMMAND test_sync WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
