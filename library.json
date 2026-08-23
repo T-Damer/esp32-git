@@ -1,0 +1,19 @@
+{
+  "name": "esp32-git",
+  "version": "0.1.0",
+  "description": "Minimal real-git client for ESP32 + SD card: loose objects, fast-forward-only sync, verified against stock git.",
+  "license": "MIT",
+  "keywords": "git version-control esp32 sd-card",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/T-Damer/esp32-git.git"
+  },
+  "build": {
+    "srcInclude": ["src/*.cpp", "src/*.c", "third_party/uzlib/tinflate.c"],
+    "includeDir": "include",
+    "srcDir": "src"
+  },
+  "export": {
+    "exclude": ["build", "docs", "test"]
+  }
+}

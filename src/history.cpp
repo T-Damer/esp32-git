@@ -1,5 +1,6 @@
 #include "history.h"
 
+#include <algorithm>
 #include <ctime>
 #include <map>
 #include <cstdio>
