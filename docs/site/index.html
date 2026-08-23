@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>esp32-git — real git for microcontrollers</title>
+<style>
+  :root {
+    --ink: #1c1c1c;
+    --paper: #faf9f6;
+    --accent: #2f5d3a;
+    --muted: #6b6b66;
+    --code-bg: #f0efe9;
+    --line: #e3e1d8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Iowan Old Style", Georgia, serif;
+    background: var(--paper);
+    color: var(--ink);
+    line-height: 1.65;
+  }
+  main { max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem 5rem; }
+  header h1 { font-size: 2rem; margin: 0 0 .25rem; letter-spacing: -.01em; }
+  header p.tag { color: var(--muted); margin: 0 0 2.5rem; font-style: italic; }
+  h2 {
+    font-size: 1.05rem; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--accent); margin-top: 2.75rem;
+    border-bottom: 1px solid var(--line); padding-bottom: .35rem;
+  }
+  code, pre {
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: .82rem;
+  }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line);
+    border-radius: 6px; padding: .9rem 1rem; overflow-x: auto;
+  }
+  code.inline, li code, p code { background: var(--code-bg); padding: .06em .35em; border-radius: 4px; }
+  table { border-collapse: collapse; width: 100%; font-size: .92rem; }
+  td, th { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .ok { color: var(--accent); font-weight: 600; }
+  .no { color: #a05a2c; font-weight: 600; }
+  footer { margin-top: 4rem; color: var(--muted); font-size: .85rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>esp32&#8209;git</h1>
+    <p class="tag">A minimal git client for ESP32 + SD card &mdash; verified against stock git.</p>
+  </header>
+
+  <p>
+    esp32&#8209;git lets firmware on an ESP32-C3/S3 (built for the Xteink reader family)
+    keep a <em>real</em> git repository on the SD card: notes committed on the device are
+    plain commits that any PC with stock git can log, check out, and push &mdash; and
+    history written by desktop git syncs back onto the device.
+  </p>
+
+  <h2>What works today</h2>
+  <table>
+    <tr><th>Area</th><th>Status</th><th>Notes</th></tr>
+    <tr><td><code>init</code>, <code>add</code>, <code>commit</code>, <code>status</code></td><td class="ok">done</td><td>loose objects under <code>.git/objects/xx/&hellip;</code>; nested trees; proper author stamps</td></tr>
+    <tr><td><code>clone</code> / <code>pull</code> / <code>push</code></td><td class="ok">done</td><td>fast-forward only; divergence refused instead of merged; worktree materialized after clone and pull</td></tr>
+    <tr><td>PC interop</td><td class="ok">verified</td><td><code>git fsck --strict</code>, <code>git log</code>, <code>git cat-file</code> read device-written repos; device reads git-deflated objects</td></tr>
+    <tr><td>Transport</td><td class="ok">file · <span class="no">smart-HTTP next</span></td><td>remote = a directory containing <code>.git/</code> (SD card, WebDAV mount)</td></tr>
+    <tr><td>Packfiles</td><td class="no">read later</td><td>servers may send packs on fetch; pushes never need them (loose objects accepted by git servers for small payloads)</td></tr>
+    <tr><td>Merge / rebase / branches</td><td class="no">by design</td><td>a vault sync tool, not a VCS workbench</td></tr>
+  </table>
+
+  <h2>Getting started (host)</h2>
+  <pre>git clone https://github.com/T-Damer/esp32-git.git
+cd esp32-git
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure   # every claim is anchored to real git</pre>
+
+  <h2>Using it in firmware</h2>
+  <pre>#include "esp32_git.h"
+
+const esp32git_identity me = {"Vault User", "vault@example.com"};
+
+// one-time: create .git/ on the SD card
+esp32git_init("/sdcard/vault");
+
+// stage and commit note changes
+esp32git_add("/sdcard/vault", "notes/today.md");
+char sha[41];
+esp32git_commit("/sdcard/vault", &amp;me, "morning notes", sha);
+
+// sync: fast-forward only, fails cleanly when histories diverge
+esp32git_push("/mnt/backup/vault.git", "main", "/sdcard/vault");
+esp32git_status st = esp32git_fetch("/mnt/backup/vault.git", "main", "/sdcard/vault");
+if (st == ESP32GIT_REMOTE_DIVERGED) {
+  // surface a conflict notice to the user - we never merge silently
+}</pre>
+
+  <h2>How it stays small</h2>
+  <ul>
+    <li>Streaming SHA-1 (~120 lines) and zlib framing over the tiny
+      <a href="https://github.com/pfalcon/uzlib">uzlib</a>; no dynamic allocation in
+      steady state beyond two bounded scratch buffers.</li>
+    <li>Objects are written loose exactly like git stores them &mdash; so nothing needs a
+      pack writer to be correct.</li>
+    <li>The staging index is a documented sidecar (<code>.git/esp32git-index</code>)
+      stock git ignores; native index-format support is a drop-in upgrade if needed.</li>
+    <li>File I/O sits behind a handful of calls, ready to map onto an SD-card HAL
+      (e.g. CrossPoint&rsquo;s <code>HalStorage</code>) for on-device builds.</li>
+  </ul>
+
+  <h2>Roadmap</h2>
+  <ol>
+    <li>smart-HTTP transport (<code>/info/refs</code>, upload/receive-pack) over TLS;</li>
+    <li>packfile reading for fetches against hosting providers;</li>
+    <li>PlatformIO library registration + HalStorage backend;</li>
+    <li>native <code>.git/index</code> format (optional).</li>
+  </ol>
+
+  <footer>
+    MIT licensed. Part of the <a href="https://github.com/T-Damer/microMarkD">microMarkD</a>
+    ecosystem &mdash; an Obsidian-style vault for e-ink readers.
+  </footer>
+</main>
+</body>
+</html>
