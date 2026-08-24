@@ -83,7 +83,7 @@ static int esp32git_zlib_parse_header_impl(struct uzlib_uncomp *d) {
 
 // The vendored tinflate.c references uzlib_crc32 for the gzip checksum path
 // but ships without it; provide the standard table-less implementation.
-uint32_t uzlib_crc32(const void *data, unsigned int length, uint32_t crc) {
+__attribute__((weak)) uint32_t uzlib_crc32(const void *data, unsigned int length, uint32_t crc) {
   const unsigned char *p = data;
   while (length--) {
     crc ^= *p++;
@@ -95,7 +95,7 @@ uint32_t uzlib_crc32(const void *data, unsigned int length, uint32_t crc) {
 }
 
 // Also stripped from the vendored tinflate.c: the Adler-32 accumulator.
-uint32_t uzlib_adler32(const void *data, unsigned int length, uint32_t checksum) {
+__attribute__((weak)) uint32_t uzlib_adler32(const void *data, unsigned int length, uint32_t checksum) {
   const unsigned char *p = data;
   uint32_t s1 = checksum & 0xffff;
   uint32_t s2 = checksum >> 16;

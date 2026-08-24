@@ -200,6 +200,14 @@ esp32git_status esp32git_commit(const char *repo_path, const esp32git_identity *
 
   char parent[41] = "";
   esp32git_resolve_head(repo_path, parent); // unborn branch: parent stays ""
+  if (parent[0]) {
+    // Like git: a commit whose tree equals its parent's is a no-op.
+    char parent_tree[41];
+    if (esp32git_head_tree(repo_path, parent, parent_tree) == ESP32GIT_OK &&
+        strcmp(parent_tree, tree) == 0) {
+      return ESP32GIT_UP_TO_DATE;
+    }
+  }
 
   st = esp32git_commit_create(repo_path, *id, message, tree, parent, out_sha);
   if (st != ESP32GIT_OK) return st;
