@@ -102,6 +102,35 @@ esp32git_status esp32git_push(const char *remote_dir, const char *branch,
 esp32git_status esp32git_clone(const char *remote_dir, const char *branch,
                                const char *workdir);
 
+// ---- smart-HTTP transport ---------------------------------------------------
+// Buffer-based; response bodies are allocated with new[] and released through
+// esp32git_free_buffer. Register a port before any *_url call.
+typedef struct esp32git_http_port {
+  // Returns HTTP status (200..599) or negative transport error; 401/403 map
+  // to AUTH_FAILED. is_post selects GET/POST; user/token enable basic auth.
+  int (*request)(const char *url, int is_post, const char *user,
+                 const char *token, const char *content_type,
+                 const uint8_t *body, size_t body_len, uint8_t **out_body,
+                 size_t *out_len);
+} esp32git_http_port;
+
+void esp32git_http_register(const esp32git_http_port *port);
+void esp32git_free_buffer(uint8_t *body);
+
+esp32git_status esp32git_fetch_url(const char *remote_url, const char *branch,
+                                   const char *repo_path);
+esp32git_status esp32git_fetch_url_auth(const char *remote_url, const char *branch,
+                                        const char *repo_path,
+                                        const esp32git_remote *auth);
+esp32git_status esp32git_push_url(const char *remote_url, const char *branch,
+                                  const char *repo_path);
+esp32git_status esp32git_push_url_auth(const char *remote_url, const char *branch,
+                                       const char *repo_path,
+                                       const esp32git_remote *auth);
+esp32git_status esp32git_clone_url(const char *remote_url, const char *branch,
+                                   const char *workdir,
+                                   const esp32git_remote *auth);
+
 #ifdef __cplusplus
 }
 #endif

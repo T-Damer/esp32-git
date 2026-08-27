@@ -6,8 +6,6 @@
 
 #include "uzlib.h"
 
-static int esp32git_zlib_parse_header_impl(struct uzlib_uncomp *d);
-
 size_t esp32git_zlib_stored_bound(size_t in_len) {
   return 2 + in_len + (in_len / 65535) + 5 + 4;
 }
@@ -61,7 +59,7 @@ long esp32git_zlib_inflate(const uint8_t *in, size_t in_len, uint8_t *out,
   d.dest = out;
   d.dest_limit = out + out_cap;
 
-  int rc = esp32git_zlib_parse_header_impl(&d);
+  int rc = zlib_parse_header(&d);
   if (rc != TINF_OK) return rc;
   rc = uzlib_uncompress_chksum(&d); // validates the Adler-32 trailer
   if (rc != TINF_DONE) return (rc == TINF_OK) ? TINF_DATA_ERROR : rc;
@@ -70,7 +68,7 @@ long esp32git_zlib_inflate(const uint8_t *in, size_t in_len, uint8_t *out,
 
 // The vendored tinflate.c omits the RFC 1950 preamble parser; a minimal one:
 // validate CMF/FLG, reject dictionaries, arm the Adler-32 accumulator.
-static int esp32git_zlib_parse_header_impl(struct uzlib_uncomp *d) {
+int zlib_parse_header(struct uzlib_uncomp *d) {
   const unsigned char cmf = (unsigned char)uzlib_get_byte(d);
   const unsigned char flg = (unsigned char)uzlib_get_byte(d);
   if ((cmf & 0x0f) != 8) return TINF_DATA_ERROR;            // only method 8

@@ -65,10 +65,13 @@ esp32git_status build_tree(const char *repo, const std::string &prefix,
   std::string payload;
   payload.reserve(items.size() * 40 + 32);
   for (const auto &item : items) {
-    char head[48];
-    const int n = snprintf(head, sizeof(head), "%s %s", item.is_dir ? "40000" : "100644",
-                           item.name.c_str());
-    payload.append(head, (size_t)n + 1); // includes NUL
+    // UTF-8 names can exceed any fixed buffer; build the entry at its own size.
+    std::string entry;
+    entry.reserve(item.name.size() + 28);
+    entry += item.is_dir ? "40000 " : "100644 ";
+    entry += item.name;
+    entry.push_back('\0');
+    payload.append(entry);
     uint8_t raw[20];
     esp32git_hex_to_bytes(item.sha.c_str(), raw);
     payload.append((const char *)raw, 20);

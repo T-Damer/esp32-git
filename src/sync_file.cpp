@@ -175,7 +175,8 @@ esp32git_status checkout_tree(const char *repo_path, const char *tree_sha) {
   return esp32git_index_save(repo_path, index_entries);
 }
 
-// Refreshes the worktree + staging index at a commit id.
+// Refreshes the worktree + staging index at a commit id. Shared with the
+// HTTP transport (see sync_internal.h).
 esp32git_status materialize_head(const char *repo_path, const char *head_sha) {
   char tree[41];
   if (esp32git_head_tree(repo_path, head_sha, tree) != ESP32GIT_OK) {
@@ -185,6 +186,16 @@ esp32git_status materialize_head(const char *repo_path, const char *head_sha) {
 }
 
 } // namespace
+
+esp32git_status e32g_checkout_tree_at(const char *repo_path, const char *tree_sha) {
+  return checkout_tree(repo_path, tree_sha);
+}
+
+namespace e32g {
+esp32git_status checkout_tree_at(const char *repo_path, const char *tree_sha) {
+  return checkout_tree(repo_path, tree_sha);
+}
+} // namespace e32g
 
 esp32git_status esp32git_init(const char *workdir) { return esp32git_repo_init(workdir); }
 
