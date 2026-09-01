@@ -35,6 +35,13 @@ bool pack_read(const uint8_t *data, size_t len,
                const std::string &scratch_repo, // loose objects for REF_DELTA
                const std::function<void(const PackEntry &)> &on_entry);
 
+// Reads and resolves a pack stored in a random-access file. The pack itself,
+// compressed input windows, and the OFS_DELTA lookup index stay off-heap; only
+// the current object's bounded working set is resident.
+bool pack_read_file(const std::string &path, uint64_t offset, uint64_t len,
+                    const std::string &scratch_repo,
+                    const std::function<void(const PackEntry &)> &on_entry);
+
 // Writes count objects as a non-delta v2 pack; returns the full pack bytes
 // including the trailing SHA-1 over the pack contents.
 std::vector<uint8_t> pack_write(const std::vector<PackEntry> &entries);

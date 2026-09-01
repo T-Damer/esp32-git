@@ -9,6 +9,7 @@
 
 #include "esp32_git.h"
 #include "history.h"
+#include "io.h"
 #include "pack.h"
 #include "pkt.h"
 #include "repo.h"
@@ -31,7 +32,7 @@ struct RefAd {
 // GET /info/refs?service=<svc>; strips the preamble and parses "<sha> <name>".
 esp32git_status discover(const esp32git_remote &auth, const char *url,
                          const char *service, std::vector<RefAd> &refs) {
-  if (!active_http) return ESP32GIT_PROTOCOL_ERROR;
+  if (!active_http || !active_http->request) return ESP32GIT_PROTOCOL_ERROR;
   const std::string full = std::string(url) + "/info/refs?service=" + service;
   uint8_t *body = nullptr;
   size_t len = 0;
@@ -99,6 +100,93 @@ esp32git_status store_pack(const uint8_t *data, size_t len, const char *repo_pat
     return ESP32GIT_PROTOCOL_ERROR; // malformed pack
   }
   return ok ? ESP32GIT_OK : ESP32GIT_IO_ERROR;
+}
+
+esp32git_status store_pack_file(const std::string &path, uint64_t offset,
+                                uint64_t len, const char *repo_path) {
+  bool ok = true;
+  if (!pack_read_file(path, offset, len, repo_path,
+                      [&](const PackEntry &e) {
+                        const char *type = e.type == PACK_COMMIT    ? "commit"
+                                           : e.type == PACK_TREE    ? "tree"
+                                           : e.type == PACK_TAG     ? "tag"
+                                                                    : "blob";
+                        char got[41];
+                        if (esp32git_object_write(repo_path, type, e.data.data(),
+                                                  e.data.size(), got) !=
+                            ESP32GIT_OK) {
+                          ok = false;
+                        }
+                      })) {
+    return ESP32GIT_PROTOCOL_ERROR;
+  }
+  return ok ? ESP32GIT_OK : ESP32GIT_IO_ERROR;
+}
+
+struct PackFileSink {
+  e32g::File *file = nullptr;
+  bool ok = true;
+};
+
+int write_pack_chunk(void *context, const uint8_t *data, size_t len) {
+  auto *sink = static_cast<PackFileSink *>(context);
+  if (!sink || !sink->file || (len > 0 && !data) ||
+      !sink->file->write(data, len)) {
+    if (sink) sink->ok = false;
+    return -1;
+  }
+  return 0;
+}
+
+struct TemporaryFile {
+  explicit TemporaryFile(const std::string &path) : path(path) {}
+  ~TemporaryFile() { e32g::remove_file(path); }
+  std::string path;
+};
+
+esp32git_status fetch_pack_stream(const std::string &post_url,
+                                  const std::string &request,
+                                  const esp32git_remote &auth,
+                                  const char *repo_path) {
+  const std::string pack_path =
+      std::string(repo_path) + "/.git/esp32git-pack.tmp";
+  TemporaryFile cleanup(pack_path);
+  e32g::File output;
+  if (!output.open(pack_path, true)) return ESP32GIT_IO_ERROR;
+
+  PackFileSink sink = {&output, true};
+  size_t response_len = 0;
+  const int status = active_http->request_stream(
+      post_url.c_str(), 1, auth.user, auth.token,
+      "application/x-git-upload-pack-request",
+      reinterpret_cast<const uint8_t *>(request.data()), request.size(),
+      write_pack_chunk, &sink, &response_len);
+  if (!output.close()) sink.ok = false;
+  if (status == 401 || status == 403) return ESP32GIT_AUTH_FAILED;
+  if (status < 0 || !sink.ok) return ESP32GIT_IO_ERROR;
+  if (status != 200) return ESP32GIT_PROTOCOL_ERROR;
+
+  const int64_t written = e32g::file_size(pack_path);
+  if (written < 0 || (uint64_t)written != response_len) {
+    return ESP32GIT_IO_ERROR;
+  }
+
+  uint64_t pack_offset = 0;
+  if (response_len >= 8) {
+    e32g::File input;
+    uint8_t prefix[8];
+    size_t got = 0;
+    if (!input.open(pack_path, false) ||
+        !input.read(prefix, sizeof(prefix), &got) || got != sizeof(prefix) ||
+        !input.close()) {
+      return ESP32GIT_IO_ERROR;
+    }
+    // Without side-band the server prefixes the pack with a "NAK\n" pkt.
+    if (memcmp(prefix, "0008NAK\n", sizeof(prefix)) == 0) pack_offset = 8;
+  }
+  if (response_len < pack_offset + 32) return ESP32GIT_PROTOCOL_ERROR;
+  return store_pack_file(pack_path, pack_offset, response_len - pack_offset,
+                         repo_path);
 }
 
 // Objects reachable from new_head but not from base_head ("" = all).
@@ -218,36 +306,41 @@ esp32git_status fetch_url(const char *remote_url, const char *branch,
   pkt_flush(req);
   req += "0009done\n";
 
-  uint8_t *resp = nullptr;
-  size_t resp_len = 0;
   const std::string post_url = std::string(remote_url) + "/git-upload-pack";
-  const int status = active_http->request(
-      post_url.c_str(), 1, auth.user, auth.token,
-      "application/x-git-upload-pack-request", (const uint8_t *)req.data(),
-      req.size(), &resp, &resp_len);
-  if (status == 401 || status == 403) {
-    if (resp) esp32git_free_buffer(resp);
-    return ESP32GIT_AUTH_FAILED;
+  esp32git_status st = ESP32GIT_PROTOCOL_ERROR;
+  if (active_http->request_stream && e32g::has_file_io()) {
+    st = fetch_pack_stream(post_url, req, auth, repo_path);
+  } else {
+    uint8_t *resp = nullptr;
+    size_t resp_len = 0;
+    const int status = active_http->request(
+        post_url.c_str(), 1, auth.user, auth.token,
+        "application/x-git-upload-pack-request", (const uint8_t *)req.data(),
+        req.size(), &resp, &resp_len);
+    if (status == 401 || status == 403) {
+      if (resp) esp32git_free_buffer(resp);
+      return ESP32GIT_AUTH_FAILED;
+    }
+    if (status != 200) {
+      if (resp) esp32git_free_buffer(resp);
+      return status < 0 ? ESP32GIT_IO_ERROR : ESP32GIT_PROTOCOL_ERROR;
+    }
+    const uint8_t *pack = resp;
+    size_t pack_len = resp_len;
+    // Without side-band the server prefixes the pack with a "NAK\n" pkt.
+    if (pack_len >= 8 && memcmp(pack, "0008", 4) == 0) {
+      pack += 8;
+      pack_len -= 8;
+    }
+    st = store_pack(pack, pack_len, repo_path);
+    esp32git_free_buffer(resp);
   }
-  if (status != 200) {
-    if (resp) esp32git_free_buffer(resp);
-    return ESP32GIT_PROTOCOL_ERROR;
-  }
-  const uint8_t *pack = resp;
-  size_t pack_len = resp_len;
-  // Without side-band the server prefixes the pack with a "NAK\n" pkt.
-  if (pack_len >= 8 && memcmp(pack, "0008", 4) == 0) {
-    pack += 8;
-    pack_len -= 8;
-  }
-  const esp32git_status st = store_pack(pack, pack_len, repo_path);
   {
     char ptype[16] = "";
     uint8_t probe[8];
     size_t plen = 0;
     const esp32git_status pr = esp32git_object_read(repo_path, rhead, ptype, sizeof(ptype), probe, sizeof(probe), &plen);
   }
-  esp32git_free_buffer(resp);
   if (st != ESP32GIT_OK) return st;
 
   const std::string refname = esp32git_branch_ref(branch);

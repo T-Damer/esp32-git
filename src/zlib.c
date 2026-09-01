@@ -51,19 +51,27 @@ int esp32git_zlib_deflate_stored(const uint8_t *in, size_t in_len, uint8_t *out,
 
 long esp32git_zlib_inflate(const uint8_t *in, size_t in_len, uint8_t *out,
                            size_t out_cap) {
-  struct uzlib_uncomp d;
-  uzlib_uncompress_init(&d, NULL, 0);
-  d.source = in;
-  d.source_limit = in + in_len;
-  d.dest_start = out;
-  d.dest = out;
-  d.dest_limit = out + out_cap;
+  // uzlib_uncomp contains both Huffman tables; keep it off the small ESP32
+  // task stack, matching the file-backed pack inflater.
+  struct uzlib_uncomp *d = calloc(1, sizeof(*d));
+  if (!d) return TINF_DATA_ERROR;
+  uzlib_uncompress_init(d, NULL, 0);
+  d->source = in;
+  d->source_limit = in + in_len;
+  d->dest_start = out;
+  d->dest = out;
+  d->dest_limit = out + out_cap;
 
-  int rc = zlib_parse_header(&d);
-  if (rc != TINF_OK) return rc;
-  rc = uzlib_uncompress_chksum(&d); // validates the Adler-32 trailer
-  if (rc != TINF_DONE) return (rc == TINF_OK) ? TINF_DATA_ERROR : rc;
-  return (long)(d.dest - out);
+  int rc = zlib_parse_header(d);
+  if (rc != TINF_OK) {
+    free(d);
+    return rc;
+  }
+  rc = uzlib_uncompress_chksum(d); // validates the Adler-32 trailer
+  const long result = rc != TINF_DONE ? (rc == TINF_OK ? TINF_DATA_ERROR : rc)
+                                      : (long)(d->dest - out);
+  free(d);
+  return result;
 }
 
 // The vendored tinflate.c omits the RFC 1950 preamble parser; a minimal one:

@@ -91,6 +91,8 @@ struct uzlib_uncomp {
        besides returning the next byte, it may also update source and
        source_limit fields, thus allowing for buffered operation. */
     int (*source_read_cb)(struct uzlib_uncomp *uncomp);
+    /* Opaque context passed to source_read_cb by buffered readers. */
+    void *source_read_context;
 
     unsigned int tag;
     unsigned int bitcount;

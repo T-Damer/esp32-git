@@ -36,7 +36,12 @@ int esp32git_object_path(const char *repo_path, const char *sha, char *out,
 esp32git_status esp32git_object_write(const char *repo_path, const char *type,
                                       const void *payload, size_t len,
                                       char out_sha[41]) {
-  if (!repo_path || !type || !out_sha || !payload) return ESP32GIT_IO_ERROR;
+  if (!repo_path || !type || !out_sha || (len > 0 && !payload)) {
+    return ESP32GIT_IO_ERROR;
+  }
+  const uint8_t *payload_bytes =
+      len > 0 ? static_cast<const uint8_t *>(payload)
+              : reinterpret_cast<const uint8_t *>("");
 
   // Object = "<type> <size>\0" + payload.
   char header[32];
@@ -46,7 +51,7 @@ esp32git_status esp32git_object_write(const char *repo_path, const char *type,
   esp32git_sha1 sha;
   esp32git_sha1_init(&sha);
   esp32git_sha1_update(&sha, header, (size_t)header_len + 1); // includes NUL
-  esp32git_sha1_update(&sha, payload, len);
+  esp32git_sha1_update(&sha, payload_bytes, len);
   uint8_t digest[20];
   esp32git_sha1_final(&sha, digest);
   hex_digest(digest, out_sha);
@@ -59,7 +64,7 @@ esp32git_status esp32git_object_write(const char *repo_path, const char *type,
   uint8_t *raw = new (std::nothrow) uint8_t[raw_len];
   if (!raw) return ESP32GIT_OUT_OF_MEMORY;
   memcpy(raw, header, (size_t)header_len + 1);
-  memcpy(raw + header_len + 1, payload, len);
+  if (len > 0) memcpy(raw + header_len + 1, payload_bytes, len);
 
   const size_t bound = esp32git_zlib_stored_bound(raw_len);
   uint8_t *compressed = new (std::nothrow) uint8_t[bound];

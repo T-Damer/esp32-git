@@ -62,7 +62,61 @@ int http_request(const char *url, int is_post, const char *user,
   return (int)status;
 }
 
-const esp32git_http_port kCurlPort = {http_request};
+struct StreamSink {
+  esp32git_http_write_callback write;
+  void *context;
+  size_t total = 0;
+  bool failed = false;
+};
+
+size_t stream_write_cb(uint8_t *ptr, size_t size, size_t nmemb, void *userp) {
+  auto *sink = (StreamSink *)userp;
+  const size_t len = size * nmemb;
+  if (!sink || sink->write(sink->context, ptr, len) != 0) {
+    if (sink) sink->failed = true;
+    return 0;
+  }
+  sink->total += len;
+  return len;
+}
+
+int http_request_stream(const char *url, int is_post, const char *user,
+                        const char *token, const char *content_type,
+                        const uint8_t *body, size_t body_len,
+                        esp32git_http_write_callback write, void *context,
+                        size_t *out_len) {
+  if (!write || !out_len) return -1;
+  CURL *curl = curl_easy_init();
+  if (!curl) return -1;
+  curl_easy_setopt(curl, CURLOPT_URL, url);
+  curl_slist *headers = nullptr;
+  if (is_post) {
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body_len);
+    if (content_type) {
+      headers = curl_slist_append(nullptr, (std::string("Content-Type: ") + content_type).c_str());
+      curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    }
+  }
+  if (user && token) {
+    curl_easy_setopt(curl, CURLOPT_USERNAME, user);
+    curl_easy_setopt(curl, CURLOPT_PASSWORD, token);
+  }
+  StreamSink sink = {write, context};
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stream_write_cb);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &sink);
+  const CURLcode rc = curl_easy_perform(curl);
+  long status = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+  if (headers) curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+  *out_len = sink.total;
+  if (rc != CURLE_OK || sink.failed) return -1;
+  return (int)status;
+}
+
+const esp32git_http_port kCurlPort = {http_request, http_request_stream};
 
 void run(const char *cmd, char *out, size_t cap) {
   FILE *f = popen(cmd, "r");
@@ -90,7 +144,9 @@ int failures = 0;
 
 int main(void) {
   system("rm -rf build/fixtures/http && mkdir -p build/fixtures/http/root");
-  if (system("git init -q --bare build/fixtures/http/root/vault.git") != 0) {
+  if (system("git init -q --bare build/fixtures/http/root/vault.git && "
+             "git --git-dir=build/fixtures/http/root/vault.git "
+             "symbolic-ref HEAD refs/heads/main") != 0) {
     fprintf(stderr, "FAIL: bare origin\n");
     return 1;
   }
@@ -154,6 +210,8 @@ int main(void) {
   f = fopen("build/fixtures/http/device/from-pc.md", "rb");
   CHECK(f != NULL, "pull materialized the PC's file");
   if (f) fclose(f);
+  CHECK(access("build/fixtures/http/device/.git/esp32git-pack.tmp", F_OK) != 0,
+        "streamed pack temporary file was cleaned up");
 
   if (failures == 0) {
     printf("all http checks passed\n");

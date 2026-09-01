@@ -2,6 +2,8 @@
 
 #include <sys/stat.h>
 
+#include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -54,8 +56,45 @@ int stdio_make_dirs(const char *dir_chain) {
   return (stat(dir_chain, &st) == 0 && S_ISDIR(st.st_mode)) ? 0 : -1;
 }
 
-const esp32git_fs_port kStdioPort = {stdio_size,   stdio_read, stdio_write,
-                                     stdio_exists, stdio_make_dirs};
+void *stdio_file_open(const char *path, int write) {
+  return fopen(path, write ? "w+b" : "rb");
+}
+
+int stdio_file_read(void *handle, uint8_t *buf, size_t cap, size_t *out_len) {
+  if (!handle || !buf || !out_len) return -1;
+  FILE *file = static_cast<FILE *>(handle);
+  *out_len = fread(buf, 1, cap, file);
+  return ferror(file) ? -1 : 0;
+}
+
+int stdio_file_write(void *handle, const uint8_t *data, size_t len) {
+  if (!handle || (len > 0 && !data)) return -1;
+  FILE *file = static_cast<FILE *>(handle);
+  return fwrite(data, 1, len, file) == len ? 0 : -1;
+}
+
+int stdio_file_seek(void *handle, uint64_t offset) {
+  if (!handle || offset > static_cast<uint64_t>(LONG_MAX)) return -1;
+  return fseek(static_cast<FILE *>(handle), static_cast<long>(offset), SEEK_SET);
+}
+
+int stdio_file_close(void *handle) {
+  return handle ? fclose(static_cast<FILE *>(handle)) : 0;
+}
+
+int stdio_remove(const char *path) {
+  return std::remove(path) == 0 || errno == ENOENT ? 0 : -1;
+}
+
+const esp32git_fs_port kStdioPort = {
+    stdio_size,
+    stdio_read,
+    stdio_write,
+    stdio_exists,
+    stdio_make_dirs,
+    {stdio_file_open, stdio_file_read, stdio_file_write, stdio_file_seek,
+     stdio_file_close},
+    stdio_remove};
 
 const esp32git_fs_port &p() {
   return active_port ? *active_port : kStdioPort;
@@ -64,6 +103,63 @@ const esp32git_fs_port &p() {
 } // namespace
 
 void fs_register(const ::esp32git_fs_port *new_port) { active_port = new_port; }
+
+File::~File() { close(); }
+
+File::File(File &&other) noexcept
+    : port_(other.port_), handle_(other.handle_) {
+  other.port_ = nullptr;
+  other.handle_ = nullptr;
+}
+
+File &File::operator=(File &&other) noexcept {
+  if (this == &other) return *this;
+  close();
+  port_ = other.port_;
+  handle_ = other.handle_;
+  other.port_ = nullptr;
+  other.handle_ = nullptr;
+  return *this;
+}
+
+bool File::open(const std::string &path, bool write) {
+  close();
+  const esp32git_fs_port &fs = p();
+  if (!fs.file.open) return false;
+  void *handle = fs.file.open(path.c_str(), write ? 1 : 0);
+  if (!handle) return false;
+  port_ = &fs.file;
+  handle_ = handle;
+  return true;
+}
+
+bool File::read(uint8_t *buf, size_t cap, size_t *out_len) {
+  if (!port_ || !port_->read || !out_len) return false;
+  if (cap == 0) {
+    *out_len = 0;
+    return true;
+  }
+  if (!buf) return false;
+  return port_->read(handle_, buf, cap, out_len) == 0;
+}
+
+bool File::write(const uint8_t *data, size_t len) {
+  if (!port_ || !port_->write) return false;
+  if (len == 0) return true;
+  return data && port_->write(handle_, data, len) == 0;
+}
+
+bool File::seek(uint64_t offset) {
+  return port_ && port_->seek && port_->seek(handle_, offset) == 0;
+}
+
+bool File::close() {
+  if (!handle_) return true;
+  const int result = port_ && port_->close ? port_->close(handle_) : -1;
+  port_ = nullptr;
+  handle_ = nullptr;
+  return result == 0;
+}
 
 int64_t file_size(const std::string &path) {
   return p().size ? p().size(path.c_str()) : -1;
@@ -92,6 +188,19 @@ bool exists(const std::string &path) {
 
 bool make_dirs(const std::string &dir_chain) {
   return p().make_dirs ? p().make_dirs(dir_chain.c_str()) == 0 : false;
+}
+
+bool has_file_io() {
+  const esp32git_fs_port &fs = p();
+  return fs.file.open && fs.file.read && fs.file.write && fs.file.seek &&
+         fs.file.close && fs.remove;
+}
+
+bool remove_file(const std::string &path) {
+  const esp32git_fs_port &fs = p();
+  if (!fs.remove) return false;
+  if (fs.exists && fs.exists(path.c_str()) == 0) return true;
+  return fs.remove(path.c_str()) == 0;
 }
 
 } // namespace e32g

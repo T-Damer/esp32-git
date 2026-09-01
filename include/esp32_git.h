@@ -1,8 +1,8 @@
 #pragma once
 
 // esp32-git: minimal git client for ESP32 + SD card.
-// Loose objects only; fast-forward-only push/pull; file transport now,
-// smart-HTTP transport planned; verified against stock git.
+// Loose objects only; fast-forward-only push/pull; file and smart-HTTP
+// transports; verified against stock git.
 
 #include <stddef.h>
 #include <stdint.h>
@@ -24,7 +24,7 @@ typedef enum {
 } esp32git_status;
 
 typedef struct {
-  const char *url;   // https://host/org/repo.git (HTTP transport, planned)
+  const char *url;   // https://host/org/repo.git (HTTP transport)
   const char *user;  // basic auth user (often a token name)
   const char *token; // basic auth password
 } esp32git_remote;
@@ -38,6 +38,20 @@ typedef struct {
 // Register on-device to back all library file access with an SD-card HAL
 // (e.g. HalStorage). Leave NULL members or skip registration to use the
 // built-in host stdio backend. Call before any other API; single-threaded.
+typedef struct esp32git_file_port {
+  // Opens a regular file. write=0 reads from the start; write=1 truncates and
+  // opens a read/write file. The returned handle belongs to the caller.
+  void *(*open)(const char *path, int write);
+  // Reads up to cap bytes from the current position; sets *out_len.
+  int (*read)(void *handle, uint8_t *buf, size_t cap, size_t *out_len);
+  // Writes len bytes at the current position.
+  int (*write)(void *handle, const uint8_t *data, size_t len);
+  // Moves the current position to an absolute byte offset.
+  int (*seek)(void *handle, uint64_t offset);
+  // Closes and releases the handle.
+  int (*close)(void *handle);
+} esp32git_file_port;
+
 typedef struct esp32git_fs_port {
   // Byte size of a regular file, -1 when missing/unreadable.
   int64_t (*size)(const char *path);
@@ -49,6 +63,10 @@ typedef struct esp32git_fs_port {
   int (*exists)(const char *path);
   // Creates a directory chain itself (like mkdir -p); 0 ok.
   int (*make_dirs)(const char *dir_chain);
+  // Optional streaming file operations. Old ports may leave this member NULL.
+  esp32git_file_port file;
+  // Removes a regular file; 0 ok. Required for temporary pack cleanup.
+  int (*remove)(const char *path);
 } esp32git_fs_port;
 
 void esp32git_fs_register(const esp32git_fs_port *port);
@@ -103,8 +121,12 @@ esp32git_status esp32git_clone(const char *remote_dir, const char *branch,
                                const char *workdir);
 
 // ---- smart-HTTP transport ---------------------------------------------------
-// Buffer-based; response bodies are allocated with new[] and released through
-// esp32git_free_buffer. Register a port before any *_url call.
+// Buffer-based; response bodies are allocated by the registered port and
+// released through esp32git_free_buffer. Used for advertisements and push
+// responses, and as a fallback when streaming is unavailable.
+typedef int (*esp32git_http_write_callback)(void *context,
+                                            const uint8_t *data, size_t len);
+
 typedef struct esp32git_http_port {
   // Returns HTTP status (200..599) or negative transport error; 401/403 map
   // to AUTH_FAILED. is_post selects GET/POST; user/token enable basic auth.
@@ -112,6 +134,14 @@ typedef struct esp32git_http_port {
                  const char *token, const char *content_type,
                  const uint8_t *body, size_t body_len, uint8_t **out_body,
                  size_t *out_len);
+  // Streams the response body to write(context, data, len). The callback
+  // returns 0 to continue or nonzero to abort. out_len is bytes delivered.
+  // Returns the HTTP status or negative transport/callback error.
+  int (*request_stream)(const char *url, int is_post, const char *user,
+                        const char *token, const char *content_type,
+                        const uint8_t *body, size_t body_len,
+                        esp32git_http_write_callback write,
+                        void *context, size_t *out_len);
 } esp32git_http_port;
 
 void esp32git_http_register(const esp32git_http_port *port);

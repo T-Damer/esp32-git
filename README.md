@@ -38,13 +38,18 @@ stash.
 - **Transport:** HTTPS smart-HTTP (`/info/refs?service=git-upload-pack`,
   `git-upload-pack` POST for fetch; `git-receive-pack` for push). TLS via the
   TLS stack already shipped in CrossPoint firmware (wolfSSL). Auth = user +
-  token (basic).
+  token (basic). Advertisements and push responses use the buffer callback;
+  fetch can use `request_stream` to write the upload-pack response directly to
+  storage.
 - **Packfiles:** parse them for fetch (servers may answer with a pack);
-  never generate them — pushes send loose objects only, which git servers
-  accept for small payloads via `git-receive-pack`.
-- **RAM budget:** streaming SHA-1 and inflate with a fixed 8–16 KiB window;
-  no full-file buffering. Designed to coexist with a 48 KB framebuffer on a
-  ~380 KB RAM part.
+  file-backed fetch parsing reads compressed input through a 1 KiB window and
+  keeps the OFS_DELTA offset index in a temporary sidecar file. The temporary
+  `.git/esp32git-pack.tmp` and `.idx` files are removed after parsing. Pushes
+  still send loose objects only, which git servers accept for small payloads
+  via `git-receive-pack`.
+- **RAM budget:** the HTTP response is no longer buffered as one allocation;
+  the pack reader still limits an individual inflated object and delta result
+  to 64 KiB, with the current object/base/delta working set resident.
 
 ## Building blocks (already present in CrossPoint firmware)
 

@@ -552,6 +552,7 @@ void uzlib_init(void)
 void uzlib_uncompress_init(TINF_DATA *d, void *dict, unsigned int dictLen)
 {
    d->eof = 0;
+   d->source_read_context = NULL;
    d->bitcount = 0;
    d->bfinal = 0;
    d->btype = -1;
