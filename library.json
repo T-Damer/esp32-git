@@ -9,7 +9,7 @@
     "url": "https://github.com/T-Damer/esp32-git.git"
   },
   "build": {
-    "srcInclude": ["src/*.cpp", "src/*.c", "third_party/uzlib/tinflate.c"],
+    "srcInclude": ["src/*.cpp", "src/*.c"],
     "includeDir": "include",
     "srcDir": "src",
     "flags": ["-I third_party/uzlib"]
