@@ -11,7 +11,8 @@
   "build": {
     "srcInclude": ["src/*.cpp", "src/*.c", "third_party/uzlib/tinflate.c"],
     "includeDir": "include",
-    "srcDir": "src"
+    "srcDir": "src",
+    "flags": ["-I third_party/uzlib"]
   },
   "export": {
     "exclude": ["build", "docs", "test"]
