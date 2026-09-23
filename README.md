@@ -51,6 +51,13 @@ stash.
   the pack reader still limits an individual inflated object and delta result
   to 64 KiB, with the current object/base/delta working set resident.
 
+For a private GitHub repository, use its HTTPS `.git` URL with an
+`esp32git_remote` whose `user` is `x-access-token` and `token` is a
+repository-scoped token with Contents access. Pass it to `esp32git_clone_url`,
+`esp32git_fetch_url_auth`, and `esp32git_push_url_auth`; keep the token out of
+the URL and repository files. The current client clones the full repository,
+so a large vault needs partial-clone support before it can fit on an Xteink.
+
 ## Building blocks (already present in CrossPoint firmware)
 
 | need      | reuse                                        |

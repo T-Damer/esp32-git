@@ -168,10 +168,15 @@ int main(void) {
   esp32git_http_register(&kCurlPort);
   const char *url = "http://127.0.0.1:8931/vault.git";
   const char *work = "build/fixtures/http/device";
+  const esp32git_remote auth = {url, "x-access-token", "local-test-token"};
   const esp32git_identity id = {"Vault User", "vault@example.com"};
 
+  CHECK(esp32git_clone_url(url, "main", "build/fixtures/http/denied", nullptr) ==
+            ESP32GIT_AUTH_FAILED,
+        "private remote rejects anonymous clone");
+
   // ---- clone an EMPTY remote (must stay OK and leave an unborn branch) -----
-  const esp32git_status cl = esp32git_clone_url(url, "main", work, nullptr);
+  const esp32git_status cl = esp32git_clone_url(url, "main", work, &auth);
   CHECK(cl == ESP32GIT_OK || cl == ESP32GIT_UP_TO_DATE, "clone of empty remote");
 
   // ---- commit locally and PUSH over smart HTTP ------------------------------
@@ -181,7 +186,7 @@ int main(void) {
   CHECK(esp32git_add(work, "note.md") == ESP32GIT_OK, "add");
   char c1[41];
   CHECK(esp32git_commit(work, &id, "device commit", c1) == ESP32GIT_OK, "commit");
-  const esp32git_status push = esp32git_push_url(url, "main", work);
+  const esp32git_status push = esp32git_push_url_auth(url, "main", work, &auth);
   CHECK(push == ESP32GIT_OK, "push over smart HTTP");
 
   // Stock git verifies the server side.
@@ -206,7 +211,7 @@ int main(void) {
   system("git -C build/fixtures/http/pc add from-pc.md && git -C build/fixtures/http/pc "
          "-c user.name=pc -c user.email=pc@x commit -qm 'pc commit'");
   system("git -C build/fixtures/http/pc push -q origin main 2>&1");
-  CHECK(esp32git_fetch_url(url, "main", work) == ESP32GIT_OK, "pull over smart HTTP");
+  CHECK(esp32git_fetch_url_auth(url, "main", work, &auth) == ESP32GIT_OK, "pull over private smart HTTP");
   f = fopen("build/fixtures/http/device/from-pc.md", "rb");
   CHECK(f != NULL, "pull materialized the PC's file");
   if (f) fclose(f);
