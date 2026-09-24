@@ -313,6 +313,16 @@ int main(void) {
   CHECK(esp32git_download_path_url(url, books, "Books/book.epub", &auth) ==
             ESP32GIT_OK, "book fetch resolves non-main HEAD");
 
+  const char *complete = "build/fixtures/http/complete";
+  CHECK(esp32git_clone_url_partial(url, "main", complete, &auth) == ESP32GIT_OK,
+        "fresh partial clone for full completion");
+  CHECK(access("build/fixtures/http/complete/Books/book.epub", F_OK) != 0,
+        "full completion starts without the large book");
+  CHECK(esp32git_download_missing_files_url(url, complete, &auth) == ESP32GIT_OK,
+        "manual full worktree completion downloads omitted files");
+  CHECK(access("build/fixtures/http/complete/Books/book.epub", F_OK) == 0,
+        "completed worktree contains the large book");
+
   if (failures == 0) {
     printf("all http checks passed\n");
     return 0;
