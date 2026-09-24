@@ -189,6 +189,12 @@ esp32git_status esp32git_download_missing_notes_url(const char *remote_url,
                                                     const char *repo_path,
                                                     const esp32git_remote *auth);
 
+// One-time full worktree completion, including large attachments. This can
+// transfer hundreds of megabytes; callers should expose it as a manual action.
+esp32git_status esp32git_download_missing_files_url(const char *remote_url,
+                                                    const char *repo_path,
+                                                    const esp32git_remote *auth);
+
 #ifdef __cplusplus
 }
 #endif

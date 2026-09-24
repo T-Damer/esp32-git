@@ -476,9 +476,10 @@ esp32git_status download_path_url(const char *remote_url, const char *repo_path,
                                                     : ESP32GIT_IO_ERROR;
 }
 
-esp32git_status download_missing_notes_url(const char *remote_url,
-                                            const char *repo_path,
-                                            const esp32git_remote &auth) {
+esp32git_status download_missing_url(const char *remote_url,
+                                     const char *repo_path,
+                                     const esp32git_remote &auth,
+                                     bool notes_only) {
   e32g::File index;
   if (!index.open(std::string(repo_path) + "/.git/esp32git-index", false)) {
     return ESP32GIT_NOT_A_REPO;
@@ -488,7 +489,7 @@ esp32git_status download_missing_notes_url(const char *remote_url,
     const std::string path = line.substr(41);
     const bool note = (path.size() >= 3 && path.compare(path.size() - 3, 3, ".md") == 0) ||
                       (path.size() >= 4 && path.compare(path.size() - 4, 4, ".txt") == 0);
-    if (!note) return ESP32GIT_OK;
+    if (notes_only && !note) return ESP32GIT_OK;
     const std::string destination = std::string(repo_path) + "/" + path;
     if (e32g::exists(destination)) return ESP32GIT_OK;
     const std::string sha = line.substr(0, 40);
@@ -688,6 +689,14 @@ esp32git_status esp32git_download_missing_notes_url(const char *remote_url,
                                                     const char *repo_path,
                                                     const esp32git_remote *auth) {
   const esp32git_remote anon = {nullptr, nullptr, nullptr};
-  return e32g::download_missing_notes_url(remote_url, repo_path,
-                                           auth ? *auth : anon);
+  return e32g::download_missing_url(remote_url, repo_path,
+                                    auth ? *auth : anon, true);
+}
+
+esp32git_status esp32git_download_missing_files_url(const char *remote_url,
+                                                    const char *repo_path,
+                                                    const esp32git_remote *auth) {
+  const esp32git_remote anon = {nullptr, nullptr, nullptr};
+  return e32g::download_missing_url(remote_url, repo_path,
+                                    auth ? *auth : anon, false);
 }

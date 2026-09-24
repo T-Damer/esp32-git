@@ -30,6 +30,11 @@ foreach(t objects commit sync fs_port)
   add_test(NAME ${t} COMMAND test_${t} WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endforeach()
 
+add_executable(test_pack test/test_pack.cc)
+target_link_libraries(test_pack PRIVATE esp32git)
+target_include_directories(test_pack PRIVATE src third_party/uzlib)
+add_test(NAME pack COMMAND test_pack WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
 if(CURL_FOUND)
   add_executable(test_http test/test_http.cc)
   target_link_libraries(test_http PRIVATE esp32git CURL::libcurl)

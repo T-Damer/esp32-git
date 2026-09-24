@@ -246,14 +246,8 @@ bool pack_read(const uint8_t *data, size_t len, const std::string &scratch_repo,
         base.assign(loose.data(), loose.data() + loose_len);
         ref_base_type = type; // resolved object keeps the base's type
       }
-      size_t dat = 0;
-      uint64_t src_size = 0;
-      if (!read_delta_size(r.payload.data(), r.payload.size(), dat, src_size) ||
-          src_size != base.size()) {
-        return false;
-      }
-      if (!delta_apply(base.data(), base.size(), r.payload.data() + dat,
-                       r.payload.size() - dat, e.data)) {
+      if (!delta_apply(base.data(), base.size(), r.payload.data(),
+                       r.payload.size(), e.data)) {
         return false;
       }
       // The resolved object keeps its base's type.
@@ -569,20 +563,8 @@ bool pack_read_file(const std::string &path, uint64_t offset, uint64_t len,
       if (base_type == 0) base_type = pack_type_from_name(base_type_name);
       if (base_type == 0) return false;
 
-      size_t delta_at = 0;
-      uint64_t source_size = 0;
-      uint64_t destination_size = 0;
-      if (!read_delta_size(inflated.data(), inflated.size(), delta_at,
-                           source_size) ||
-          source_size != base.size() ||
-          !read_delta_size(inflated.data(), inflated.size(), delta_at,
-                           destination_size) ||
-          destination_size > kMaxObjectBytes) {
-        return false;
-      }
-      if (!delta_apply(base.data(), base.size(),
-                       inflated.data() + delta_at,
-                       inflated.size() - delta_at, resolved)) {
+      if (!delta_apply(base.data(), base.size(), inflated.data(),
+                       inflated.size(), resolved)) {
         return false;
       }
       entry.type = base_type;
