@@ -305,6 +305,14 @@ int main(void) {
         strstr(note, "remote edit") == nullptr,
         "conflict leaves local note unchanged");
 
+  system("git -C build/fixtures/http/pc checkout -qb books && "
+         "git -C build/fixtures/http/pc push -q origin books");
+  const char *books = "build/fixtures/http/books";
+  CHECK(esp32git_clone_url_partial(url, "books", books, &auth) == ESP32GIT_OK,
+        "partial clone supports a non-main branch");
+  CHECK(esp32git_download_path_url(url, books, "Books/book.epub", &auth) ==
+            ESP32GIT_OK, "book fetch resolves non-main HEAD");
+
   if (failures == 0) {
     printf("all http checks passed\n");
     return 0;

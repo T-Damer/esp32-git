@@ -637,6 +637,10 @@ esp32git_status esp32git_clone_url(const char *remote_url, const char *branch,
                                    const esp32git_remote *auth) {
   esp32git_status st = esp32git_repo_init(workdir);
   if (st != ESP32GIT_OK) return st;
+  const std::string head_ref = "ref: " + esp32git_branch_ref(branch) + "\n";
+  if (!e32g::write_whole(std::string(workdir) + "/.git/HEAD",
+                         reinterpret_cast<const uint8_t *>(head_ref.data()),
+                         head_ref.size())) return ESP32GIT_IO_ERROR;
   const esp32git_remote anon = {nullptr, nullptr, nullptr};
   st = e32g::fetch_url(remote_url, branch, workdir, auth ? *auth : anon);
   if (st != ESP32GIT_OK) return st;
@@ -664,6 +668,10 @@ esp32git_status esp32git_clone_url_partial(const char *remote_url,
                                            const esp32git_remote *auth) {
   const esp32git_status st = esp32git_repo_init(workdir);
   if (st != ESP32GIT_OK) return st;
+  const std::string head_ref = "ref: " + esp32git_branch_ref(branch) + "\n";
+  if (!e32g::write_whole(std::string(workdir) + "/.git/HEAD",
+                         reinterpret_cast<const uint8_t *>(head_ref.data()),
+                         head_ref.size())) return ESP32GIT_IO_ERROR;
   return esp32git_fetch_url_partial(remote_url, branch, workdir, auth);
 }
 
