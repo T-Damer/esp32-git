@@ -55,5 +55,6 @@ bool has_file_io();
 
 // Removes a temporary or regular file. Missing files are treated as success.
 bool remove_file(const std::string &path);
+bool rename_file(const std::string &from, const std::string &to);
 
 } // namespace e32g

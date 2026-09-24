@@ -2,6 +2,7 @@
 #include "hexutil.h"
 
 #include <new>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -31,7 +32,8 @@ struct RefAd {
 
 // GET /info/refs?service=<svc>; strips the preamble and parses "<sha> <name>".
 esp32git_status discover(const esp32git_remote &auth, const char *url,
-                         const char *service, std::vector<RefAd> &refs) {
+                         const char *service, std::vector<RefAd> &refs,
+                         std::string *capabilities = nullptr) {
   if (!active_http || !active_http->request) return ESP32GIT_PROTOCOL_ERROR;
   const std::string full = std::string(url) + "/info/refs?service=" + service;
   uint8_t *body = nullptr;
@@ -63,16 +65,23 @@ esp32git_status discover(const esp32git_remote &auth, const char *url,
     ad.sha = line.substr(0, 40);
     ad.name = line.substr(sp + 1);
     const size_t nul = ad.name.find('\0');
-    if (nul != std::string::npos) ad.name.resize(nul); // drop capability block
+    if (nul != std::string::npos) {
+      if (capabilities && capabilities->empty()) {
+        *capabilities = ad.name.substr(nul + 1);
+      }
+      ad.name.resize(nul);
+    }
     refs.push_back(std::move(ad));
   }
   return refs.empty() ? ESP32GIT_INVALID_REF : ESP32GIT_OK;
 }
 
 esp32git_status remote_head(const esp32git_remote &auth, const char *url,
-                            const char *branch, char out[41]) {
+                            const char *branch, char out[41],
+                            std::string *capabilities = nullptr) {
   std::vector<RefAd> refs;
-  const esp32git_status st = discover(auth, url, "git-upload-pack", refs);
+  const esp32git_status st = discover(auth, url, "git-upload-pack", refs,
+                                     capabilities);
   if (st != ESP32GIT_OK) return st;
   const std::string want = esp32git_branch_ref(branch);
   for (const auto &r : refs) {
@@ -82,6 +91,40 @@ esp32git_status remote_head(const esp32git_remote &auth, const char *url,
     }
   }
   return ESP32GIT_INVALID_REF; // unborn remote branch
+}
+
+bool has_capability(const std::string &capabilities, const char *name) {
+  const std::string padded = " " + capabilities + " ";
+  return padded.find(std::string(" ") + name + " ") != std::string::npos;
+}
+
+// Git's upload-pack may send shallow/ACK pkt-lines before the raw PACK bytes.
+bool pack_offset(const uint8_t *data, size_t len, size_t &offset) {
+  offset = 0;
+  while (offset + 4 <= len && offset < 4096) {
+    if (memcmp(data + offset, "PACK", 4) == 0) return true;
+    char hex[5];
+    memcpy(hex, data + offset, 4);
+    hex[4] = '\0';
+    char *end = nullptr;
+    const unsigned long packet = strtoul(hex, &end, 16);
+    if (end != hex + 4 || packet > len - offset ||
+        (packet > 0 && packet < 4)) return false;
+    if (packet == 0) {
+      offset += 4;
+      continue;
+    }
+    const char *line = reinterpret_cast<const char *>(data + offset + 4);
+    const size_t line_len = packet - 4;
+    if (!(line_len >= 4 && memcmp(line, "NAK\n", 4) == 0) &&
+        !(line_len >= 4 && memcmp(line, "ACK ", 4) == 0) &&
+        !(line_len >= 8 && memcmp(line, "shallow ", 8) == 0) &&
+        !(line_len >= 10 && memcmp(line, "unshallow ", 10) == 0)) {
+      return false;
+    }
+    offset += packet;
+  }
+  return false;
 }
 
 esp32git_status store_pack(const uint8_t *data, size_t len, const char *repo_path) {
@@ -147,7 +190,9 @@ struct TemporaryFile {
 esp32git_status fetch_pack_stream(const std::string &post_url,
                                   const std::string &request,
                                   const esp32git_remote &auth,
-                                  const char *repo_path) {
+                                  const char *repo_path,
+                                  const char *blob_sha = nullptr,
+                                  const char *destination = nullptr) {
   const std::string pack_path =
       std::string(repo_path) + "/.git/esp32git-pack.tmp";
   TemporaryFile cleanup(pack_path);
@@ -171,22 +216,29 @@ esp32git_status fetch_pack_stream(const std::string &post_url,
     return ESP32GIT_IO_ERROR;
   }
 
-  uint64_t pack_offset = 0;
-  if (response_len >= 8) {
-    e32g::File input;
-    uint8_t prefix[8];
+  static uint8_t prefix[4096];
+  const size_t prefix_len = response_len < sizeof(prefix) ? response_len : sizeof(prefix);
+  e32g::File input;
+  if (!input.open(pack_path, false)) return ESP32GIT_IO_ERROR;
+  size_t read_at = 0;
+  while (read_at < prefix_len) {
     size_t got = 0;
-    if (!input.open(pack_path, false) ||
-        !input.read(prefix, sizeof(prefix), &got) || got != sizeof(prefix) ||
-        !input.close()) {
+    if (!input.read(prefix + read_at, prefix_len - read_at, &got) || got == 0) {
       return ESP32GIT_IO_ERROR;
     }
-    // Without side-band the server prefixes the pack with a "NAK\n" pkt.
-    if (memcmp(prefix, "0008NAK\n", sizeof(prefix)) == 0) pack_offset = 8;
+    read_at += got;
   }
-  if (response_len < pack_offset + 32) return ESP32GIT_PROTOCOL_ERROR;
-  return store_pack_file(pack_path, pack_offset, response_len - pack_offset,
-                         repo_path);
+  if (!input.close()) return ESP32GIT_IO_ERROR;
+  size_t payload_offset = 0;
+  if (!pack_offset(prefix, prefix_len, payload_offset) ||
+      response_len < payload_offset + 32) return ESP32GIT_PROTOCOL_ERROR;
+  if (blob_sha) {
+    return pack_extract_blob_file(pack_path, payload_offset,
+                                  response_len - payload_offset, blob_sha,
+                                  destination) ? ESP32GIT_OK : ESP32GIT_PROTOCOL_ERROR;
+  }
+  return store_pack_file(pack_path, payload_offset,
+                         response_len - payload_offset, repo_path);
 }
 
 // Objects reachable from new_head but not from base_head ("" = all).
@@ -287,23 +339,60 @@ bool collect_delta_objects(const char *repo_path, const char *new_head,
   return true;
 }
 
+bool safe_relative_path(const char *path) {
+  if (!path || !*path || *path == '/') return false;
+  const char *part = path;
+  for (const char *p = path;; ++p) {
+    if (*p == '\\') return false;
+    if (*p != '/' && *p != '\0') continue;
+    const size_t len = (size_t)(p - part);
+    if (len == 0 || (len == 1 && part[0] == '.') ||
+        (len == 2 && part[0] == '.' && part[1] == '.')) return false;
+    if (*p == '\0') return true;
+    part = p + 1;
+  }
+}
+
 } // namespace
 
 void http_register(const esp32git_http_port *port) { active_http = port; }
 
 
 esp32git_status fetch_url(const char *remote_url, const char *branch,
-                          const char *repo_path, const esp32git_remote &auth) {
+                          const char *repo_path, const esp32git_remote &auth,
+                          bool partial = false) {
   if (!active_http) return ESP32GIT_PROTOCOL_ERROR;
   char rhead[41];
-  const esp32git_status rr = remote_head(auth, remote_url, branch, rhead);
+  std::string capabilities;
+  const esp32git_status rr = remote_head(auth, remote_url, branch, rhead,
+                                         partial ? &capabilities : nullptr);
   if (rr == ESP32GIT_INVALID_REF) return ESP32GIT_UP_TO_DATE; // unborn remote
   if (rr != ESP32GIT_OK) return rr;
+  if (partial && (!has_capability(capabilities, "filter") ||
+                  !has_capability(capabilities, "shallow"))) {
+    return ESP32GIT_PROTOCOL_ERROR;
+  }
+  char local_head[41];
+  const esp32git_status local_status = esp32git_resolve_head(repo_path, local_head);
+  if (local_status == ESP32GIT_OK && strcmp(local_head, rhead) == 0) {
+    return ESP32GIT_UP_TO_DATE;
+  }
 
   // want <rhead> / flush / done  ->  server replies [NAK pkt] + packfile.
   std::string req;
-  pkt_write(req, std::string("want ") + rhead + " " + AGENT + "\n");
+  pkt_write(req, std::string("want ") + rhead +
+                 (partial ? " filter shallow " : " ") + AGENT + "\n");
+  if (partial) {
+    if (local_status == ESP32GIT_OK) {
+      pkt_write(req, std::string("shallow ") + local_head + "\n");
+    }
+    pkt_write(req, "deepen 1\n");
+    pkt_write(req, "filter blob:limit=60000\n");
+  }
   pkt_flush(req);
+  if (partial && local_status == ESP32GIT_OK) {
+    pkt_write(req, std::string("have ") + local_head + "\n");
+  }
   req += "0009done\n";
 
   const std::string post_url = std::string(remote_url) + "/git-upload-pack";
@@ -325,44 +414,107 @@ esp32git_status fetch_url(const char *remote_url, const char *branch,
       if (resp) esp32git_free_buffer(resp);
       return status < 0 ? ESP32GIT_IO_ERROR : ESP32GIT_PROTOCOL_ERROR;
     }
-    const uint8_t *pack = resp;
-    size_t pack_len = resp_len;
-    // Without side-band the server prefixes the pack with a "NAK\n" pkt.
-    if (pack_len >= 8 && memcmp(pack, "0008", 4) == 0) {
-      pack += 8;
-      pack_len -= 8;
+    size_t payload_offset = 0;
+    if (pack_offset(resp, resp_len, payload_offset)) {
+      st = store_pack(resp + payload_offset, resp_len - payload_offset, repo_path);
     }
-    st = store_pack(pack, pack_len, repo_path);
     esp32git_free_buffer(resp);
-  }
-  {
-    char ptype[16] = "";
-    uint8_t probe[8];
-    size_t plen = 0;
-    const esp32git_status pr = esp32git_object_read(repo_path, rhead, ptype, sizeof(ptype), probe, sizeof(probe), &plen);
   }
   if (st != ESP32GIT_OK) return st;
 
   const std::string refname = esp32git_branch_ref(branch);
-  char lhead[41];
-  const esp32git_status rl = esp32git_resolve_head(repo_path, lhead);
-  if (rl == ESP32GIT_INVALID_REF) {
-    const esp32git_status w = esp32git_write_ref(repo_path, refname.c_str(), rhead);
-    char tree[41];
-    if (esp32git_head_tree(repo_path, rhead, tree) != ESP32GIT_OK) {
-      return ESP32GIT_IO_ERROR;
-    }
-    const esp32git_status co = e32g::checkout_tree_at(repo_path, tree);
-    return co;
-  }
-  if (strcmp(lhead, rhead) == 0) return ESP32GIT_UP_TO_DATE;
-  const esp32git_status w = esp32git_write_ref(repo_path, refname.c_str(), rhead);
   char tree[41];
   if (esp32git_head_tree(repo_path, rhead, tree) != ESP32GIT_OK) {
     return ESP32GIT_IO_ERROR;
   }
-  const esp32git_status co = e32g::checkout_tree_at(repo_path, tree);
-  return co;
+  if (partial) {
+    const esp32git_status co = e32g::checkout_tree_partial_at(repo_path, tree);
+    if (co != ESP32GIT_OK) return co;
+    const std::string shallow = std::string(rhead) + "\n";
+    if (!e32g::write_whole(std::string(repo_path) + "/.git/shallow",
+                           reinterpret_cast<const uint8_t *>(shallow.data()),
+                           shallow.size())) return ESP32GIT_IO_ERROR;
+  } else {
+    const esp32git_status co = e32g::checkout_tree_at(repo_path, tree);
+    if (co != ESP32GIT_OK) return co;
+  }
+  return esp32git_write_ref(repo_path, refname.c_str(), rhead);
+}
+
+esp32git_status download_path_url(const char *remote_url, const char *repo_path,
+                                  const char *relpath,
+                                  const esp32git_remote &auth) {
+  if (!active_http || !active_http->request_stream || !e32g::has_file_io()) {
+    return ESP32GIT_PROTOCOL_ERROR;
+  }
+  if (!safe_relative_path(relpath)) return ESP32GIT_INVALID_REF;
+  char head[41], tree[41], blob[41];
+  esp32git_status st = esp32git_resolve_head(repo_path, head);
+  if (st != ESP32GIT_OK) return st;
+  st = esp32git_head_tree(repo_path, head, tree);
+  if (st != ESP32GIT_OK) return st;
+  st = esp32git_tree_lookup(repo_path, tree, relpath, blob);
+  if (st != ESP32GIT_OK) return st;
+  if (!blob[0]) return ESP32GIT_INVALID_REF;
+
+  const std::string destination = std::string(repo_path) + "/" + relpath;
+  if (e32g::exists(destination)) return ESP32GIT_UP_TO_DATE;
+  const size_t slash = destination.find_last_of('/');
+  if (slash == std::string::npos ||
+      !e32g::make_dirs(destination.substr(0, slash))) return ESP32GIT_IO_ERROR;
+  const std::string temporary = destination + ".esp32git.tmp";
+  TemporaryFile cleanup(temporary);
+
+  std::string request;
+  pkt_write(request, std::string("want ") + blob + " " + AGENT + "\n");
+  pkt_flush(request);
+  request += "0009done\n";
+  st = fetch_pack_stream(std::string(remote_url) + "/git-upload-pack",
+                         request, auth, repo_path, blob, temporary.c_str());
+  if (st != ESP32GIT_OK) return st;
+  return e32g::rename_file(temporary, destination) ? ESP32GIT_OK
+                                                    : ESP32GIT_IO_ERROR;
+}
+
+esp32git_status download_missing_notes_url(const char *remote_url,
+                                            const char *repo_path,
+                                            const esp32git_remote &auth) {
+  e32g::File index;
+  if (!index.open(std::string(repo_path) + "/.git/esp32git-index", false)) {
+    return ESP32GIT_NOT_A_REPO;
+  }
+  const auto process = [&](const std::string &line) -> esp32git_status {
+    if (line.size() < 43 || line[40] != ' ') return ESP32GIT_PROTOCOL_ERROR;
+    const std::string path = line.substr(41);
+    const bool note = (path.size() >= 3 && path.compare(path.size() - 3, 3, ".md") == 0) ||
+                      (path.size() >= 4 && path.compare(path.size() - 4, 4, ".txt") == 0);
+    if (!note) return ESP32GIT_OK;
+    const std::string destination = std::string(repo_path) + "/" + path;
+    if (e32g::exists(destination)) return ESP32GIT_OK;
+    const std::string sha = line.substr(0, 40);
+    char object_path[576];
+    if (esp32git_object_path(repo_path, sha.c_str(), object_path,
+                             sizeof(object_path))) return ESP32GIT_OK;
+    return download_path_url(remote_url, repo_path, path.c_str(), auth);
+  };
+  uint8_t buffer[1024];
+  std::string line;
+  for (;;) {
+    size_t got = 0;
+    if (!index.read(buffer, sizeof(buffer), &got)) return ESP32GIT_IO_ERROR;
+    if (got == 0) break;
+    for (size_t i = 0; i < got; ++i) {
+      if (buffer[i] == '\n') {
+        const esp32git_status st = process(line);
+        if (st != ESP32GIT_OK) return st;
+        line.clear();
+      } else {
+        if (line.size() >= 1024) return ESP32GIT_PROTOCOL_ERROR;
+        line.push_back((char)buffer[i]);
+      }
+    }
+  }
+  return line.empty() ? ESP32GIT_OK : ESP32GIT_PROTOCOL_ERROR;
 }
 
 esp32git_status push_url(const char *remote_url, const char *branch,
@@ -495,4 +647,39 @@ esp32git_status esp32git_clone_url(const char *remote_url, const char *branch,
   st = esp32git_head_tree(workdir, head, tree);
   if (st != ESP32GIT_OK) return st;
   return e32g::checkout_tree_at(workdir, tree);
+}
+
+esp32git_status esp32git_fetch_url_partial(const char *remote_url,
+                                           const char *branch,
+                                           const char *repo_path,
+                                           const esp32git_remote *auth) {
+  const esp32git_remote anon = {nullptr, nullptr, nullptr};
+  return e32g::fetch_url(remote_url, branch, repo_path, auth ? *auth : anon,
+                         true);
+}
+
+esp32git_status esp32git_clone_url_partial(const char *remote_url,
+                                           const char *branch,
+                                           const char *workdir,
+                                           const esp32git_remote *auth) {
+  const esp32git_status st = esp32git_repo_init(workdir);
+  if (st != ESP32GIT_OK) return st;
+  return esp32git_fetch_url_partial(remote_url, branch, workdir, auth);
+}
+
+esp32git_status esp32git_download_path_url(const char *remote_url,
+                                           const char *repo_path,
+                                           const char *relpath,
+                                           const esp32git_remote *auth) {
+  const esp32git_remote anon = {nullptr, nullptr, nullptr};
+  return e32g::download_path_url(remote_url, repo_path, relpath,
+                                  auth ? *auth : anon);
+}
+
+esp32git_status esp32git_download_missing_notes_url(const char *remote_url,
+                                                    const char *repo_path,
+                                                    const esp32git_remote *auth) {
+  const esp32git_remote anon = {nullptr, nullptr, nullptr};
+  return e32g::download_missing_notes_url(remote_url, repo_path,
+                                           auth ? *auth : anon);
 }

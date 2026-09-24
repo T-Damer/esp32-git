@@ -152,6 +152,8 @@ int main(void) {
   }
   // http-backend requires an export marker or GIT_HTTP_EXPORT_ALL (set server-side).
   system("git --git-dir=build/fixtures/http/root/vault.git config http.receivepack true");
+  system("git --git-dir=build/fixtures/http/root/vault.git config uploadpack.allowFilter true");
+  system("git --git-dir=build/fixtures/http/root/vault.git config uploadpack.allowReachableSHA1InWant true");
 
   // Start the CGI server.
   char start[256];
@@ -217,6 +219,91 @@ int main(void) {
   if (f) fclose(f);
   CHECK(access("build/fixtures/http/device/.git/esp32git-pack.tmp", F_OK) != 0,
         "streamed pack temporary file was cleaned up");
+
+  // Shallow partial clone keeps notes + catalog but leaves a large book
+  // available for an explicit fetch by its path in HEAD's tree.
+  system("mkdir -p build/fixtures/http/pc/Books");
+  f = fopen("build/fixtures/http/pc/Books/book.epub", "wb");
+  uint32_t random = 0x12345678;
+  for (int i = 0; i < 512 * 1024; ++i) {
+    random ^= random << 13;
+    random ^= random >> 17;
+    random ^= random << 5;
+    fputc(random & 0xff, f);
+  }
+  fclose(f);
+  f = fopen("build/fixtures/http/pc/Books/catalog.json", "wb");
+  fputs("{\"books\":[{\"path\":\"Books/book.epub\"}]}\n", f);
+  fclose(f);
+  f = fopen("build/fixtures/http/pc/large.md", "wb");
+  for (int i = 0; i < 80000; ++i) fputc('a' + (i % 26), f);
+  fclose(f);
+  system("git -C build/fixtures/http/pc add Books large.md && git -C build/fixtures/http/pc "
+         "-c user.name=pc -c user.email=pc@x commit -qm 'add book' && "
+         "git -C build/fixtures/http/pc push -q origin main");
+  const char *partial = "build/fixtures/http/partial";
+  CHECK(esp32git_clone_url_partial(url, "main", partial, &auth) == ESP32GIT_OK,
+        "partial clone over private smart HTTP");
+  CHECK(access("build/fixtures/http/partial/from-pc.md", F_OK) == 0,
+        "partial clone materialized note");
+  CHECK(access("build/fixtures/http/partial/Books/catalog.json", F_OK) == 0,
+        "partial clone materialized catalog");
+  CHECK(access("build/fixtures/http/partial/Books/book.epub", F_OK) != 0,
+        "partial clone omitted large book");
+  CHECK(access("build/fixtures/http/partial/large.md", F_OK) != 0,
+        "partial clone omitted oversized note");
+  CHECK(access("build/fixtures/http/partial/.git/shallow", F_OK) == 0,
+        "partial clone records shallow boundary");
+  CHECK(esp32git_download_missing_notes_url(url, partial, &auth) == ESP32GIT_OK,
+        "complete omitted notes");
+  CHECK(access("build/fixtures/http/partial/large.md", F_OK) == 0,
+        "oversized note is available locally");
+  CHECK(access("build/fixtures/http/partial/Books/book.epub", F_OK) != 0,
+        "completing notes leaves book on demand");
+  CHECK(esp32git_download_path_url(url, partial, "Books/book.epub", &auth) ==
+            ESP32GIT_OK, "download omitted book by Git path");
+  CHECK(esp32git_download_path_url(url, partial, "Books/book.epub", &auth) ==
+            ESP32GIT_UP_TO_DATE, "download preserves existing local book");
+  CHECK(esp32git_download_path_url(url, partial, "../outside", &auth) ==
+            ESP32GIT_INVALID_REF, "download rejects path traversal");
+  char source_sha[128], fetched_sha[128];
+  run("git hash-object build/fixtures/http/pc/Books/book.epub", source_sha,
+      sizeof(source_sha));
+  run("git hash-object build/fixtures/http/partial/Books/book.epub", fetched_sha,
+      sizeof(fetched_sha));
+  CHECK(strcmp(source_sha, fetched_sha) == 0,
+        "downloaded book matches source Git blob");
+  CHECK(access("build/fixtures/http/partial/Books/book.epub.esp32git.tmp", F_OK) != 0,
+        "download temporary file was cleaned up");
+
+  f = fopen("build/fixtures/http/pc/after-clone.md", "wb");
+  fputs("# New note\n", f);
+  fclose(f);
+  system("git -C build/fixtures/http/pc add after-clone.md && "
+         "git -C build/fixtures/http/pc -c user.name=pc -c user.email=pc@x "
+         "commit -qm 'new note' && git -C build/fixtures/http/pc push -q origin main");
+  CHECK(esp32git_fetch_url_partial(url, "main", partial, &auth) == ESP32GIT_OK,
+        "partial fetch updates a clean vault");
+  CHECK(access("build/fixtures/http/partial/after-clone.md", F_OK) == 0,
+        "partial fetch materializes new note");
+
+  f = fopen("build/fixtures/http/partial/after-clone.md", "ab");
+  fputs("local edit\n", f);
+  fclose(f);
+  f = fopen("build/fixtures/http/pc/after-clone.md", "ab");
+  fputs("remote edit\n", f);
+  fclose(f);
+  system("git -C build/fixtures/http/pc add after-clone.md && "
+         "git -C build/fixtures/http/pc -c user.name=pc -c user.email=pc@x "
+         "commit -qm 'remote edit' && git -C build/fixtures/http/pc push -q origin main");
+  CHECK(esp32git_fetch_url_partial(url, "main", partial, &auth) ==
+            ESP32GIT_REMOTE_DIVERGED, "partial fetch protects local edits");
+  f = fopen("build/fixtures/http/partial/after-clone.md", "rb");
+  char note[100] = {};
+  if (f) { fread(note, 1, sizeof(note) - 1, f); fclose(f); }
+  CHECK(strstr(note, "local edit") != nullptr &&
+        strstr(note, "remote edit") == nullptr,
+        "conflict leaves local note unchanged");
 
   if (failures == 0) {
     printf("all http checks passed\n");

@@ -55,8 +55,22 @@ For a private GitHub repository, use its HTTPS `.git` URL with an
 `esp32git_remote` whose `user` is `x-access-token` and `token` is a
 repository-scoped token with Contents access. Pass it to `esp32git_clone_url`,
 `esp32git_fetch_url_auth`, and `esp32git_push_url_auth`; keep the token out of
-the URL and repository files. The current client clones the full repository,
-so a large vault needs partial-clone support before it can fit on an Xteink.
+the URL and repository files.
+
+For a large vault, use `esp32git_clone_url_partial` and
+`esp32git_fetch_url_partial`. They request one shallow commit plus trees and
+blobs below 60 KB; omitted files remain listed in the local index.
+`esp32git_download_missing_notes_url` fills larger Markdown/TXT notes, while
+`esp32git_download_path_url` downloads a selected book or attachment by its
+path in the current Git tree. Both use Git smart-HTTP, without a hosting API.
+A changed local file makes partial fetch return `REMOTE_DIVERGED` before
+checkout overwrites it.
+
+Selective downloads need a server that advertises `filter`, `shallow`, and
+reachable-object wants. The file port needs streaming I/O and `rename`.
+Large blobs are verified by Git SHA-1 and written through a temporary file.
+The current implementation accepts a single non-delta blob pack for an
+on-demand download; a delta pack for that request is rejected.
 
 ## Building blocks (already present in CrossPoint firmware)
 

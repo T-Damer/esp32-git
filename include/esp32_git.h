@@ -67,6 +67,8 @@ typedef struct esp32git_fs_port {
   esp32git_file_port file;
   // Removes a regular file; 0 ok. Required for temporary pack cleanup.
   int (*remove)(const char *path);
+  // Optional atomic replacement for verified on-demand downloads.
+  int (*rename)(const char *from, const char *to);
 } esp32git_fs_port;
 
 void esp32git_fs_register(const esp32git_fs_port *port);
@@ -160,6 +162,32 @@ esp32git_status esp32git_push_url_auth(const char *remote_url, const char *branc
 esp32git_status esp32git_clone_url(const char *remote_url, const char *branch,
                                    const char *workdir,
                                    const esp32git_remote *auth);
+
+// Shallow partial clone/fetch: current commit, trees, and blobs below 60 KB.
+// Missing larger files stay in the index and can be downloaded by path later.
+// Returns PROTOCOL_ERROR if the server does not advertise shallow + filter.
+esp32git_status esp32git_clone_url_partial(const char *remote_url,
+                                           const char *branch,
+                                           const char *workdir,
+                                           const esp32git_remote *auth);
+esp32git_status esp32git_fetch_url_partial(const char *remote_url,
+                                           const char *branch,
+                                           const char *repo_path,
+                                           const esp32git_remote *auth);
+
+// Download one omitted blob from HEAD by its Git path into the worktree.
+// Refuses to overwrite an existing local file. The server must allow wants
+// for reachable object IDs (as Git partial-clone servers do).
+esp32git_status esp32git_download_path_url(const char *remote_url,
+                                           const char *repo_path,
+                                           const char *relpath,
+                                           const esp32git_remote *auth);
+
+// Complete omitted Markdown/TXT notes after a partial clone without fetching
+// large attachments or books. Can be retried after an interrupted download.
+esp32git_status esp32git_download_missing_notes_url(const char *remote_url,
+                                                    const char *repo_path,
+                                                    const esp32git_remote *auth);
 
 #ifdef __cplusplus
 }

@@ -86,6 +86,10 @@ int stdio_remove(const char *path) {
   return std::remove(path) == 0 || errno == ENOENT ? 0 : -1;
 }
 
+int stdio_rename(const char *from, const char *to) {
+  return std::rename(from, to);
+}
+
 const esp32git_fs_port kStdioPort = {
     stdio_size,
     stdio_read,
@@ -94,7 +98,8 @@ const esp32git_fs_port kStdioPort = {
     stdio_make_dirs,
     {stdio_file_open, stdio_file_read, stdio_file_write, stdio_file_seek,
      stdio_file_close},
-    stdio_remove};
+    stdio_remove,
+    stdio_rename};
 
 const esp32git_fs_port &p() {
   return active_port ? *active_port : kStdioPort;
@@ -201,6 +206,11 @@ bool remove_file(const std::string &path) {
   if (!fs.remove) return false;
   if (fs.exists && fs.exists(path.c_str()) == 0) return true;
   return fs.remove(path.c_str()) == 0;
+}
+
+bool rename_file(const std::string &from, const std::string &to) {
+  const esp32git_fs_port &fs = p();
+  return fs.rename && fs.rename(from.c_str(), to.c_str()) == 0;
 }
 
 } // namespace e32g

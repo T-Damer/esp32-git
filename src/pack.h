@@ -42,6 +42,11 @@ bool pack_read_file(const std::string &path, uint64_t offset, uint64_t len,
                     const std::string &scratch_repo,
                     const std::function<void(const PackEntry &)> &on_entry);
 
+// Extract a single requested blob without buffering its decompressed bytes.
+bool pack_extract_blob_file(const std::string &path, uint64_t offset,
+                            uint64_t len, const char expected_sha[41],
+                            const std::string &destination);
+
 // Writes count objects as a non-delta v2 pack; returns the full pack bytes
 // including the trailing SHA-1 over the pack contents.
 std::vector<uint8_t> pack_write(const std::vector<PackEntry> &entries);
