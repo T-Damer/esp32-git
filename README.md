@@ -59,8 +59,8 @@ the URL and repository files.
 
 For a large vault, use `esp32git_clone_url_partial` and
 `esp32git_fetch_url_partial`. They request one shallow commit plus trees and
-blobs below 60 KB; omitted files remain listed in the local index.
-`esp32git_download_missing_notes_url` fills larger Markdown/TXT notes, while
+no file blobs; all files remain listed in the local index.
+`esp32git_download_missing_notes_url` fills Markdown/TXT notes, while
 `esp32git_download_path_url` downloads a selected book or attachment by its
 path in the current Git tree. Both use Git smart-HTTP, without a hosting API.
 `esp32git_download_missing_files_url` can complete the entire worktree on SD

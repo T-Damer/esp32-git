@@ -387,7 +387,7 @@ esp32git_status fetch_url(const char *remote_url, const char *branch,
       pkt_write(req, std::string("shallow ") + local_head + "\n");
     }
     pkt_write(req, "deepen 1\n");
-    pkt_write(req, "filter blob:limit=60000\n");
+    pkt_write(req, "filter blob:none\n");
   }
   pkt_flush(req);
   if (partial && local_status == ESP32GIT_OK) {

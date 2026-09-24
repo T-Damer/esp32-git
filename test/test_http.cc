@@ -220,8 +220,8 @@ int main(void) {
   CHECK(access("build/fixtures/http/device/.git/esp32git-pack.tmp", F_OK) != 0,
         "streamed pack temporary file was cleaned up");
 
-  // Shallow partial clone keeps notes + catalog but leaves a large book
-  // available for an explicit fetch by its path in HEAD's tree.
+  // Shallow partial clone keeps only trees; even tiny books require an
+  // explicit fetch by path in HEAD's tree.
   system("mkdir -p build/fixtures/http/pc/Books");
   f = fopen("build/fixtures/http/pc/Books/book.epub", "wb");
   uint32_t random = 0x12345678;
@@ -235,6 +235,9 @@ int main(void) {
   f = fopen("build/fixtures/http/pc/Books/catalog.json", "wb");
   fputs("{\"books\":[{\"path\":\"Books/book.epub\"}]}\n", f);
   fclose(f);
+  f = fopen("build/fixtures/http/pc/Books/tiny.epub", "wb");
+  fputs("small book fixture\n", f);
+  fclose(f);
   f = fopen("build/fixtures/http/pc/large.md", "wb");
   for (int i = 0; i < 80000; ++i) fputc('a' + (i % 26), f);
   fclose(f);
@@ -244,10 +247,12 @@ int main(void) {
   const char *partial = "build/fixtures/http/partial";
   CHECK(esp32git_clone_url_partial(url, "main", partial, &auth) == ESP32GIT_OK,
         "partial clone over private smart HTTP");
-  CHECK(access("build/fixtures/http/partial/from-pc.md", F_OK) == 0,
-        "partial clone materialized note");
-  CHECK(access("build/fixtures/http/partial/Books/catalog.json", F_OK) == 0,
-        "partial clone materialized catalog");
+  CHECK(access("build/fixtures/http/partial/from-pc.md", F_OK) != 0,
+        "partial clone omits small note until requested");
+  CHECK(access("build/fixtures/http/partial/Books/catalog.json", F_OK) != 0,
+        "partial clone omits catalog blob");
+  CHECK(access("build/fixtures/http/partial/Books/tiny.epub", F_OK) != 0,
+        "partial clone omits small book");
   CHECK(access("build/fixtures/http/partial/Books/book.epub", F_OK) != 0,
         "partial clone omitted large book");
   CHECK(access("build/fixtures/http/partial/large.md", F_OK) != 0,
@@ -256,10 +261,14 @@ int main(void) {
         "partial clone records shallow boundary");
   CHECK(esp32git_download_missing_notes_url(url, partial, &auth) == ESP32GIT_OK,
         "complete omitted notes");
+  CHECK(access("build/fixtures/http/partial/from-pc.md", F_OK) == 0,
+        "note is available locally after completion");
   CHECK(access("build/fixtures/http/partial/large.md", F_OK) == 0,
         "oversized note is available locally");
   CHECK(access("build/fixtures/http/partial/Books/book.epub", F_OK) != 0,
         "completing notes leaves book on demand");
+  CHECK(access("build/fixtures/http/partial/Books/tiny.epub", F_OK) != 0,
+        "completing notes leaves small book on demand");
   CHECK(esp32git_download_path_url(url, partial, "Books/book.epub", &auth) ==
             ESP32GIT_OK, "download omitted book by Git path");
   CHECK(esp32git_download_path_url(url, partial, "Books/book.epub", &auth) ==
@@ -284,8 +293,12 @@ int main(void) {
          "commit -qm 'new note' && git -C build/fixtures/http/pc push -q origin main");
   CHECK(esp32git_fetch_url_partial(url, "main", partial, &auth) == ESP32GIT_OK,
         "partial fetch updates a clean vault");
+  CHECK(access("build/fixtures/http/partial/after-clone.md", F_OK) != 0,
+        "partial fetch leaves new note pending");
+  CHECK(esp32git_download_missing_notes_url(url, partial, &auth) == ESP32GIT_OK,
+        "complete notes after partial fetch");
   CHECK(access("build/fixtures/http/partial/after-clone.md", F_OK) == 0,
-        "partial fetch materializes new note");
+        "new note is available after completion");
 
   f = fopen("build/fixtures/http/partial/after-clone.md", "ab");
   fputs("local edit\n", f);

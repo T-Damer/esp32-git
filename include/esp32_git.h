@@ -163,8 +163,8 @@ esp32git_status esp32git_clone_url(const char *remote_url, const char *branch,
                                    const char *workdir,
                                    const esp32git_remote *auth);
 
-// Shallow partial clone/fetch: current commit, trees, and blobs below 60 KB.
-// Missing larger files stay in the index and can be downloaded by path later.
+// Shallow partial clone/fetch: current commit and trees, without file blobs.
+// All files stay in the index and can be downloaded by path later.
 // Returns PROTOCOL_ERROR if the server does not advertise shallow + filter.
 esp32git_status esp32git_clone_url_partial(const char *remote_url,
                                            const char *branch,
