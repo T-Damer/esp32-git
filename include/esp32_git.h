@@ -69,6 +69,14 @@ typedef struct esp32git_fs_port {
   int (*remove)(const char *path);
   // Optional atomic replacement for verified on-demand downloads.
   int (*rename)(const char *from, const char *to);
+  // Optional: calls entry(ctx, name, is_dir) for each child of dir; 0 ok.
+  // Without it, esp32git_sync_url cannot notice files created on the device.
+  int (*list_dir)(const char *dir,
+                  void (*entry)(void *ctx, const char *name, int is_dir),
+                  void *ctx);
+  // Optional: size and modification time (any unit that changes on write);
+  // 0 ok. Without it, esp32git_sync_url hashes every local file to find edits.
+  int (*stat)(const char *path, int64_t *size, int64_t *mtime);
 } esp32git_fs_port;
 
 void esp32git_fs_register(const esp32git_fs_port *port);
@@ -194,6 +202,60 @@ esp32git_status esp32git_download_missing_notes_url(const char *remote_url,
 esp32git_status esp32git_download_missing_files_url(const char *remote_url,
                                                     const char *repo_path,
                                                     const esp32git_remote *auth);
+
+// ---- batched downloads and two-way sync --------------------------------------
+
+// Returns nonzero for worktree paths that should be downloaded.
+typedef int (*esp32git_path_filter)(void *ctx, const char *relpath);
+// Reports progress; `done` of `total` files, `path` the latest one (may be NULL).
+typedef void (*esp32git_progress_fn)(void *ctx, size_t done, size_t total,
+                                     const char *path);
+
+// Downloads every omitted file whose path passes `filter` (NULL = all),
+// several per request, retrying transient network failures. Files larger than
+// a pack entry allows fall back to one streamed request each. Resumable: an
+// interrupted call can simply be repeated.
+esp32git_status esp32git_download_missing_matching_url(
+    const char *remote_url, const char *repo_path, const esp32git_remote *auth,
+    esp32git_path_filter filter, void *filter_ctx,
+    esp32git_progress_fn progress, void *progress_ctx);
+
+// Markdown and text files: the filter esp32git_download_missing_notes_url uses.
+int esp32git_filter_notes(void *ctx, const char *relpath);
+
+typedef struct {
+  const char *branch;                  // NULL = "main"
+  const esp32git_identity *identity;   // author of commits made on the device
+  const char *message;                 // commit message for local changes
+  // Names conflict copies: "<name> (conflict <tag> <time>).<ext>"; NULL = "device".
+  const char *conflict_tag;
+  // Files downloaded after each fetch (NULL = esp32git_filter_notes).
+  esp32git_path_filter download_filter;
+  void *download_filter_ctx;
+  esp32git_progress_fn progress;
+  void *progress_ctx;
+} esp32git_sync_options;
+
+typedef struct {
+  unsigned pushed;      // files added, changed or deleted by this device
+  unsigned conflicts;   // local edits saved as conflict copies
+  unsigned kept_remote; // local deletions skipped because the remote changed the file
+  char last_conflict[256]; // worktree path of the latest conflict copy
+} esp32git_sync_report;
+
+// Two-way sync of a shallow partial clone (created by the first call):
+//  1. finds files created, edited or deleted on the device since the last sync
+//     (no caller bookkeeping needed);
+//  2. sets them aside, fast-forwards to the remote and downloads new files;
+//  3. reapplies the local changes: a file the remote left untouched takes the
+//     local version, a file changed on both sides keeps the remote version and
+//     gets the local one as a conflict copy, so nothing is lost;
+//  4. commits and pushes, retrying when the remote moves in between.
+// Local changes survive any failure and are retried by the next call.
+esp32git_status esp32git_sync_url(const char *remote_url, const char *repo_path,
+                                  const esp32git_remote *auth,
+                                  const esp32git_sync_options *options,
+                                  esp32git_sync_report *report);
 
 #ifdef __cplusplus
 }

@@ -12,6 +12,7 @@ add_library(esp32git STATIC
   src/repo.cpp
   src/history.cpp
   src/sync_file.cpp
+  src/sync_http.cpp
   src/pkt.cpp
   src/pack.cpp
   src/http.cpp
@@ -40,4 +41,9 @@ if(CURL_FOUND)
   target_link_libraries(test_http PRIVATE esp32git CURL::libcurl)
   target_include_directories(test_http PRIVATE src third_party/uzlib)
   add_test(NAME http COMMAND test_http WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+  add_executable(test_sync_http test/test_sync_http.cc)
+  target_link_libraries(test_sync_http PRIVATE esp32git CURL::libcurl)
+  target_include_directories(test_sync_http PRIVATE src third_party/uzlib)
+  add_test(NAME sync_http COMMAND test_sync_http WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()

@@ -57,22 +57,34 @@ repository-scoped token with Contents access. Pass it to `esp32git_clone_url`,
 `esp32git_fetch_url_auth`, and `esp32git_push_url_auth`; keep the token out of
 the URL and repository files.
 
-For a large vault, use `esp32git_clone_url_partial` and
-`esp32git_fetch_url_partial`. They request one shallow commit plus trees and
-no file blobs; all files remain listed in the local index.
-`esp32git_download_missing_notes_url` fills Markdown/TXT notes, while
-`esp32git_download_path_url` downloads a selected book or attachment by its
-path in the current Git tree. Both use Git smart-HTTP, without a hosting API.
-`esp32git_download_missing_files_url` can complete the entire worktree on SD
-as an explicit bulk action; it never downloads the old commit history.
-A changed local file makes partial fetch return `REMOTE_DIVERGED` before
-checkout overwrites it.
+For a large vault, use `esp32git_sync_url`. The first call makes a shallow
+partial clone (one commit, trees, no blobs) and downloads the files a filter
+selects (Markdown/TXT by default); later calls sync both ways:
 
-Selective downloads need a server that advertises `filter`, `shallow`, and
-reachable-object wants. The file port needs streaming I/O and `rename`.
-Large blobs are verified by Git SHA-1 and written through a temporary file.
-The current implementation accepts a single non-delta blob pack for an
-on-demand download; a delta pack for that request is rejected.
+1. files created, edited or deleted on the device since the last sync are
+   found by the library itself — a snapshot in `.git/esp32git-present` tells a
+   deleted note from one that was never downloaded, and `stat` (size + mtime)
+   avoids rehashing unchanged files;
+2. those changes are set aside (`.git/esp32git-stash/`, resumed after a crash),
+   the branch fast-forwards and new files download;
+3. each change is reapplied: a file the remote left alone takes the device
+   version; a file changed on both sides keeps the remote version and gets the
+   device version as `<name> (conflict <tag> <time>).<ext>`; an edit wins over a
+   deletion;
+4. the result is committed and pushed, retrying from step 1 when the remote
+   moves in between. Nothing local is lost on any failure.
+
+Downloads batch 48 files per upload-pack request (`ofs-delta`, so the
+streaming pack reader always has a delta's base) and retry transient network
+errors; a batch that holds a blob too large for the pack reader is split until
+only that blob is fetched on its own. On a 1,850-note vault the first download
+takes about 40 requests instead of 1,850. `esp32git_download_missing_matching_url`
+exposes the same download with any filter and a progress callback, and
+`esp32git_download_path_url` fetches one book or attachment by path.
+
+The storage port needs streaming I/O and `rename`; `list_dir` (to notice new
+files) and `stat` (to skip rehashing) are optional. The server must allow
+`filter`, `shallow` and wants of reachable object ids, as GitHub does.
 
 ## Building blocks (already present in CrossPoint firmware)
 

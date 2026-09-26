@@ -46,7 +46,7 @@ esp32git_status discover(const esp32git_remote &auth, const char *url,
   }
   if (status != 200) {
     if (body) esp32git_free_buffer(body);
-    return ESP32GIT_PROTOCOL_ERROR;
+    return status < 0 ? ESP32GIT_IO_ERROR : ESP32GIT_PROTOCOL_ERROR;
   }
   std::vector<std::string> lines;
   const bool framed = pkt_split(body, len, lines);
@@ -241,100 +241,128 @@ esp32git_status fetch_pack_stream(const std::string &post_url,
                          response_len - payload_offset, repo_path);
 }
 
-// Objects reachable from new_head but not from base_head ("" = all).
+struct TreeItem {
+  std::string name;
+  bool is_dir = false;
+  std::string sha;
+};
+
+// Blobs committed on the device may exceed the 64 KiB tree/commit bound, so
+// the buffer grows until the object fits (object_read rejects truncation).
+bool read_object(const char *repo_path, const std::string &sha, const char *want_type,
+                 std::vector<uint8_t> &out) {
+  char object_path[576];
+  if (!esp32git_object_path(repo_path, sha.c_str(), object_path, sizeof(object_path))) return false;
+  for (size_t cap : {kMaxObjectBytes, (size_t)1 << 20, (size_t)8 << 20}) {
+    out.resize(cap);
+    char type[16];
+    size_t len = 0;
+    if (esp32git_object_read(repo_path, sha.c_str(), type, sizeof(type), out.data(),
+                             out.size(), &len) == ESP32GIT_OK) {
+      if (strcmp(type, want_type) != 0) return false;
+      out.resize(len);
+      return true;
+    }
+    if (strcmp(want_type, "blob") != 0) break;
+  }
+  out.clear();
+  return false;
+}
+
+bool parse_tree(const std::vector<uint8_t> &data, std::vector<TreeItem> &items) {
+  items.clear();
+  const char *q = reinterpret_cast<const char *>(data.data());
+  const char *end = q + data.size();
+  while (q < end) {
+    const char *sp = (const char *)memchr(q, ' ', (size_t)(end - q));
+    if (!sp) return false;
+    const char *nul = (const char *)memchr(sp, '\0', (size_t)(end - sp));
+    if (!nul || end - nul < 21) return false;
+    TreeItem item;
+    item.is_dir = (sp - q == 5) && strncmp(q, "40000", 5) == 0;
+    item.name.assign(sp + 1, (size_t)(nul - sp - 1));
+    char hex[41];
+    esp32git_bytes_to_hex((const uint8_t *)(nul + 1), hex);
+    item.sha = hex;
+    items.push_back(std::move(item));
+    q = nul + 21;
+  }
+  return true;
+}
+
+void add_once(std::vector<std::string> &seen, std::vector<PackEntry> &out, int type,
+              const std::string &sha, std::vector<uint8_t> &&data) {
+  for (const auto &s : seen) if (s == sha) return;
+  seen.push_back(sha);
+  PackEntry entry;
+  entry.type = type;
+  entry.sha = sha;
+  entry.data = std::move(data);
+  out.push_back(std::move(entry));
+}
+
+// Trees and blobs of `tree` that differ from `base` ("" = no base). A blob
+// that is not stored locally belongs to history the remote already has.
+bool collect_tree_diff(const char *repo_path, const std::string &tree,
+                       const std::string &base, std::vector<std::string> &seen,
+                       std::vector<PackEntry> &out) {
+  if (tree == base) return true;
+  std::vector<uint8_t> data;
+  if (!read_object(repo_path, tree, "tree", data)) return false;
+  std::vector<TreeItem> items, base_items;
+  if (!parse_tree(data, items)) return false;
+  if (!base.empty()) {
+    std::vector<uint8_t> base_data;
+    if (read_object(repo_path, base, "tree", base_data)) parse_tree(base_data, base_items);
+  }
+  add_once(seen, out, PACK_TREE, tree, std::move(data));
+  for (const auto &item : items) {
+    std::string previous;
+    for (const auto &b : base_items) {
+      if (b.name == item.name && b.is_dir == item.is_dir) previous = b.sha;
+    }
+    if (item.sha == previous) continue;
+    if (item.is_dir) {
+      if (!collect_tree_diff(repo_path, item.sha, previous, seen, out)) return false;
+    } else {
+      std::vector<uint8_t> blob;
+      if (read_object(repo_path, item.sha, "blob", blob)) {
+        add_once(seen, out, PACK_BLOB, item.sha, std::move(blob));
+      }
+    }
+  }
+  return true;
+}
+
+// Commits from new_head back to base_head ("" = the whole local history), each
+// with only the trees and blobs its parent does not already have.
 bool collect_delta_objects(const char *repo_path, const char *new_head,
                            const char *base_head, std::vector<PackEntry> &out) {
   std::vector<std::string> commits{new_head};
-  std::vector<std::string> trees;
-  std::vector<std::string> seen_trees;
-  std::vector<std::string> seen_blobs; // shared between trees: pack each once
+  std::vector<std::string> seen;
   size_t visited = 0;
-  char type[16];
-  std::vector<char> buf(kMaxObjectBytes);
-
   while (!commits.empty() && visited++ < 4096) { // ponytail: bounded walk
     const std::string commit = commits.back();
     commits.pop_back();
-    if (base_head[0] && strcmp(commit.c_str(), base_head) == 0) continue;
-    size_t len = 0;
-    if (esp32git_object_read(repo_path, commit.c_str(), type, sizeof(type),
-                             buf.data(), buf.size(), &len) != ESP32GIT_OK) {
-      continue;
-    }
-    PackEntry ce;
-    ce.type = PACK_COMMIT;
-    ce.sha = commit;
-    ce.data.assign(buf.data(), buf.data() + len);
-    out.push_back(std::move(ce));
-
+    if (base_head[0] && commit == base_head) continue;
+    std::vector<uint8_t> data;
+    if (!read_object(repo_path, commit, "commit", data)) continue;
+    const std::string text(data.begin(), data.end());
     char tree[41] = "";
-    sscanf(buf.data(), "tree %40s", tree);
-    if (tree[0]) trees.push_back(tree);
-
-    for (const char *line = buf.data(); line < buf.data() + len;) {
-      if (strncmp(line, "parent ", 7) == 0) {
-        char parent[41] = "";
-        if (sscanf(line, "parent %40s", parent) == 1) commits.push_back(parent);
-      }
-      const char *nl =
-          (const char *)memchr(line, '\n', (size_t)(buf.data() + len - line));
-      if (!nl) break;
-      line = nl + 1;
+    sscanf(text.c_str(), "tree %40s", tree);
+    std::vector<std::string> parents;
+    for (size_t at = text.find("\nparent "); at != std::string::npos;
+         at = text.find("\nparent ", at + 1)) {
+      parents.push_back(text.substr(at + 8, 40));
     }
-  }
-
-  while (!trees.empty()) {
-    const std::string t = trees.back();
-    trees.pop_back();
-    bool dup = false;
-    for (const auto &s : seen_trees) dup |= (s == t);
-    if (dup) continue;
-    seen_trees.push_back(t);
-
-    size_t len = 0;
-    if (esp32git_object_read(repo_path, t.c_str(), type, sizeof(type),
-                             buf.data(), buf.size(), &len) != ESP32GIT_OK) {
-      continue;
+    add_once(seen, out, PACK_COMMIT, commit, std::move(data));
+    std::string parent_tree;
+    if (!parents.empty()) {
+      char ptree[41];
+      if (esp32git_head_tree(repo_path, parents[0].c_str(), ptree) == ESP32GIT_OK) parent_tree = ptree;
     }
-    PackEntry te;
-    te.type = PACK_TREE;
-    te.sha = t;
-    te.data.assign(buf.data(), buf.data() + len);
-    out.push_back(std::move(te));
-
-    const char *q = buf.data();
-    const char *end = buf.data() + len;
-    while (q < end) {
-      const char *sp = (const char *)memchr(q, ' ', (size_t)(end - q));
-      if (!sp) break;
-      const char *nul = (const char *)memchr(sp, '\0', (size_t)(end - sp));
-      if (!nul || end - nul < 21) break;
-      const bool is_dir = (sp - q == 5) && strncmp(q, "40000", 5) == 0;
-      char hex[41];
-      esp32git_bytes_to_hex((const uint8_t *)(nul + 1), hex);
-      if (is_dir) {
-        trees.push_back(hex);
-      } else {
-        bool seen = false;
-        for (const auto &s : seen_blobs) seen |= (s == hex);
-        if (seen) {
-          q = nul + 21;
-          continue;
-        }
-        seen_blobs.push_back(hex);
-        uint8_t blob[kMaxObjectBytes];
-        size_t blen = 0;
-        if (esp32git_object_read(repo_path, hex, type, sizeof(type), blob,
-                                 sizeof(blob), &blen) == ESP32GIT_OK) {
-          PackEntry be;
-          be.type = PACK_BLOB;
-          be.sha = hex;
-          be.data.assign(blob, blob + blen);
-          out.push_back(std::move(be));
-        }
-      }
-      q = nul + 21;
-    }
+    if (tree[0] && !collect_tree_diff(repo_path, tree, parent_tree, seen, out)) return false;
+    for (const auto &parent : parents) commits.push_back(parent);
   }
   return true;
 }
@@ -360,7 +388,7 @@ void http_register(const esp32git_http_port *port) { active_http = port; }
 
 esp32git_status fetch_url(const char *remote_url, const char *branch,
                           const char *repo_path, const esp32git_remote &auth,
-                          bool partial = false) {
+                          bool partial) {
   if (!active_http) return ESP32GIT_PROTOCOL_ERROR;
   char rhead[41];
   std::string capabilities;
@@ -381,7 +409,7 @@ esp32git_status fetch_url(const char *remote_url, const char *branch,
   // want <rhead> / flush / done  ->  server replies [NAK pkt] + packfile.
   std::string req;
   pkt_write(req, std::string("want ") + rhead +
-                 (partial ? " filter shallow " : " ") + AGENT + "\n");
+                 (partial ? " filter shallow ofs-delta " : " ofs-delta ") + AGENT + "\n");
   if (partial) {
     if (local_status == ESP32GIT_OK) {
       pkt_write(req, std::string("shallow ") + local_head + "\n");
@@ -476,46 +504,180 @@ esp32git_status download_path_url(const char *remote_url, const char *repo_path,
                                                     : ESP32GIT_IO_ERROR;
 }
 
+namespace {
+
+constexpr size_t kBatchFiles = 48;
+constexpr int kAttempts = 5;
+
+// Retries transient network failures; any other result is final.
+template <typename F>
+esp32git_status with_retries(F &&attempt) {
+  esp32git_status st = ESP32GIT_IO_ERROR;
+  for (int i = 0; i < kAttempts; ++i) {
+    st = attempt();
+    if (st != ESP32GIT_IO_ERROR) return st;
+  }
+  return st;
+}
+
+struct Wanted {
+  std::string sha;
+  std::string path;
+};
+
+// Writes a locally stored blob to its worktree path. The loose object is kept:
+// notes with identical content share it; drop_objects removes it afterwards.
+bool materialize_object(const char *repo_path, const Wanted &file) {
+  char object_path[576];
+  if (!esp32git_object_path(repo_path, file.sha.c_str(), object_path,
+                            sizeof(object_path))) return false;
+  std::vector<uint8_t> data(kMaxObjectBytes);
+  char type[16];
+  size_t len = 0;
+  if (esp32git_object_read(repo_path, file.sha.c_str(), type, sizeof(type),
+                           data.data(), data.size(), &len) != ESP32GIT_OK ||
+      strcmp(type, "blob") != 0) return false;
+  const std::string destination = std::string(repo_path) + "/" + file.path;
+  const size_t slash = destination.find_last_of('/');
+  if (slash == std::string::npos || !e32g::make_dirs(destination.substr(0, slash))) return false;
+  const std::string temporary = destination + ".esp32git.tmp";
+  if (!e32g::write_whole(temporary, data.data(), len) ||
+      !e32g::rename_file(temporary, destination)) {
+    e32g::remove_file(temporary);
+    return false;
+  }
+  return true;
+}
+
+// The worktree copies are what later operations read.
+void drop_objects(const char *repo_path, const std::vector<const Wanted *> &files) {
+  for (const Wanted *file : files) {
+    char object_path[576];
+    if (esp32git_object_path(repo_path, file->sha.c_str(), object_path, sizeof(object_path))) {
+      e32g::remove_file(object_path);
+    }
+  }
+}
+
+bool object_is_local(const char *repo_path, const std::string &sha) {
+  char object_path[576];
+  return esp32git_object_path(repo_path, sha.c_str(), object_path, sizeof(object_path));
+}
+
+std::vector<Wanted> missing_files(const char *repo_path, esp32git_path_filter filter,
+                                  void *filter_ctx) {
+  std::vector<esp32git_index_entry> index;
+  esp32git_index_load(repo_path, &index);
+  std::vector<Wanted> missing;
+  for (auto &entry : index) {
+    if (entry.sha.empty() || !safe_relative_path(entry.path.c_str())) continue;
+    if (filter && !filter(filter_ctx, entry.path.c_str())) continue;
+    if (e32g::exists(std::string(repo_path) + "/" + entry.path)) continue;
+    missing.push_back({entry.sha, entry.path});
+  }
+  return missing;
+}
+
+} // namespace
+
 esp32git_status download_missing_url(const char *remote_url,
                                      const char *repo_path,
                                      const esp32git_remote &auth,
                                      bool notes_only) {
-  e32g::File index;
-  if (!index.open(std::string(repo_path) + "/.git/esp32git-index", false)) {
-    return ESP32GIT_NOT_A_REPO;
+  if (!e32g::exists(std::string(repo_path) + "/.git/esp32git-index")) return ESP32GIT_NOT_A_REPO;
+  // Everything else: one streamed request per file, since attachments are
+  // usually too large to batch into a pack held in memory.
+  for (const auto &file : missing_files(repo_path, notes_only ? esp32git_filter_notes : nullptr,
+                                        nullptr)) {
+    const esp32git_status st = with_retries([&] {
+      return download_path_url(remote_url, repo_path, file.path.c_str(), auth);
+    });
+    if (st != ESP32GIT_OK && st != ESP32GIT_UP_TO_DATE) return st;
   }
-  const auto process = [&](const std::string &line) -> esp32git_status {
-    if (line.size() < 43 || line[40] != ' ') return ESP32GIT_PROTOCOL_ERROR;
-    const std::string path = line.substr(41);
-    const bool note = (path.size() >= 3 && path.compare(path.size() - 3, 3, ".md") == 0) ||
-                      (path.size() >= 4 && path.compare(path.size() - 4, 4, ".txt") == 0);
-    if (notes_only && !note) return ESP32GIT_OK;
-    const std::string destination = std::string(repo_path) + "/" + path;
-    if (e32g::exists(destination)) return ESP32GIT_OK;
-    const std::string sha = line.substr(0, 40);
-    char object_path[576];
-    if (esp32git_object_path(repo_path, sha.c_str(), object_path,
-                             sizeof(object_path))) return ESP32GIT_OK;
-    return download_path_url(remote_url, repo_path, path.c_str(), auth);
-  };
-  uint8_t buffer[1024];
-  std::string line;
-  for (;;) {
-    size_t got = 0;
-    if (!index.read(buffer, sizeof(buffer), &got)) return ESP32GIT_IO_ERROR;
-    if (got == 0) break;
-    for (size_t i = 0; i < got; ++i) {
-      if (buffer[i] == '\n') {
-        const esp32git_status st = process(line);
-        if (st != ESP32GIT_OK) return st;
-        line.clear();
-      } else {
-        if (line.size() >= 1024) return ESP32GIT_PROTOCOL_ERROR;
-        line.push_back((char)buffer[i]);
-      }
+  return ESP32GIT_OK;
+}
+
+namespace {
+
+// Fetches a group of blobs in one request. A pack the streaming reader cannot
+// finish (a blob over its limit) leaves the rest missing; the remainder is
+// split in halves so only the oversized blob ends up as a single streamed
+// request.
+esp32git_status fetch_group(const char *remote_url, const char *repo_path,
+                            const esp32git_remote &auth,
+                            std::vector<const Wanted *> files) {
+  std::vector<const Wanted *> pending;
+  for (const Wanted *file : files) {
+    if (!(object_is_local(repo_path, file->sha) && materialize_object(repo_path, *file))) {
+      pending.push_back(file);
     }
   }
-  return line.empty() ? ESP32GIT_OK : ESP32GIT_PROTOCOL_ERROR;
+  if (pending.empty()) return ESP32GIT_OK;
+  if (pending.size() == 1) {
+    return with_retries([&] {
+      const esp32git_status st =
+          download_path_url(remote_url, repo_path, pending[0]->path.c_str(), auth);
+      return st == ESP32GIT_UP_TO_DATE ? ESP32GIT_OK : st;
+    });
+  }
+  std::string request;
+  std::vector<std::string> requested;
+  for (const Wanted *file : pending) {
+    bool duplicate = false;
+    for (const auto &sha : requested) duplicate |= sha == file->sha;
+    if (duplicate) continue;
+    requested.push_back(file->sha);
+    // ofs-delta keeps every delta after its base, as the streaming reader needs.
+    pkt_write(request, "want " + file->sha +
+                           (requested.size() == 1 ? std::string(" no-progress ofs-delta ") + AGENT
+                                                  : std::string()) + "\n");
+  }
+  pkt_flush(request);
+  request += "0009done\n";
+  const std::string post_url = std::string(remote_url) + "/git-upload-pack";
+  const esp32git_status st = with_retries([&] {
+    return fetch_pack_stream(post_url, request, auth, repo_path);
+  });
+  if (st == ESP32GIT_AUTH_FAILED || st == ESP32GIT_IO_ERROR) return st;
+  std::vector<const Wanted *> left;
+  for (const Wanted *file : pending) {
+    if (!(object_is_local(repo_path, file->sha) && materialize_object(repo_path, *file))) {
+      left.push_back(file);
+    }
+  }
+  if (left.empty()) return ESP32GIT_OK;
+  const size_t half = left.size() / 2;
+  const esp32git_status first = fetch_group(
+      remote_url, repo_path, auth, std::vector<const Wanted *>(left.begin(), left.begin() + half));
+  if (first != ESP32GIT_OK) return first;
+  return fetch_group(remote_url, repo_path, auth,
+                     std::vector<const Wanted *>(left.begin() + half, left.end()));
+}
+
+} // namespace
+
+esp32git_status download_matching_url(const char *remote_url, const char *repo_path,
+                                      const esp32git_remote &auth,
+                                      esp32git_path_filter filter, void *filter_ctx,
+                                      esp32git_progress_fn progress, void *progress_ctx) {
+  if (!active_http || !active_http->request_stream || !e32g::has_file_io()) {
+    return ESP32GIT_PROTOCOL_ERROR;
+  }
+  if (!e32g::exists(std::string(repo_path) + "/.git/esp32git-index")) return ESP32GIT_NOT_A_REPO;
+  const std::vector<Wanted> missing = missing_files(repo_path, filter, filter_ctx);
+  if (progress) progress(progress_ctx, 0, missing.size(), nullptr);
+  for (size_t start = 0; start < missing.size(); start += kBatchFiles) {
+    const size_t end = start + kBatchFiles < missing.size() ? start + kBatchFiles : missing.size();
+    std::vector<const Wanted *> batch;
+    for (size_t i = start; i < end; ++i) batch.push_back(&missing[i]);
+    const esp32git_status st = fetch_group(remote_url, repo_path, auth, batch);
+    // Loose blobs are shared by notes with identical content; drop them only
+    // once the whole batch is on disk.
+    drop_objects(repo_path, batch);
+    if (st != ESP32GIT_OK) return st;
+    if (progress) progress(progress_ctx, end, missing.size(), missing[end - 1].path.c_str());
+  }
+  return ESP32GIT_OK;
 }
 
 esp32git_status push_url(const char *remote_url, const char *branch,
@@ -554,7 +716,7 @@ esp32git_status push_url(const char *remote_url, const char *branch,
     old_sha[0] = '\0'; // old head unknown locally: send full closure
   }
   std::vector<PackEntry> entries;
-  collect_delta_objects(repo_path, lhead, old_sha, entries);
+  if (!collect_delta_objects(repo_path, lhead, old_sha, entries)) return ESP32GIT_IO_ERROR;
   if (entries.empty()) return ESP32GIT_UP_TO_DATE;
 
   const std::vector<uint8_t> pack = pack_write(entries);
@@ -584,7 +746,7 @@ esp32git_status push_url(const char *remote_url, const char *branch,
   }
   if (status != 200) {
     if (resp) esp32git_free_buffer(resp);
-    return ESP32GIT_PROTOCOL_ERROR;
+    return status < 0 ? ESP32GIT_IO_ERROR : ESP32GIT_PROTOCOL_ERROR;
   }
   std::vector<std::string> lines;
   const bool framed = pkt_split(resp, resp_len, lines);
@@ -610,14 +772,14 @@ void esp32git_free_buffer(uint8_t *body) { delete[] body; }
 esp32git_status esp32git_fetch_url(const char *remote_url, const char *branch,
                                    const char *repo_path) {
   const esp32git_remote anon = {nullptr, nullptr, nullptr};
-  return e32g::fetch_url(remote_url, branch, repo_path, anon);
+  return e32g::fetch_url(remote_url, branch, repo_path, anon, false);
 }
 
 esp32git_status esp32git_fetch_url_auth(const char *remote_url, const char *branch,
                                         const char *repo_path,
                                         const esp32git_remote *auth) {
   const esp32git_remote anon = {nullptr, nullptr, nullptr};
-  return e32g::fetch_url(remote_url, branch, repo_path, auth ? *auth : anon);
+  return e32g::fetch_url(remote_url, branch, repo_path, auth ? *auth : anon, false);
 }
 
 esp32git_status esp32git_push_url(const char *remote_url, const char *branch,
@@ -643,7 +805,7 @@ esp32git_status esp32git_clone_url(const char *remote_url, const char *branch,
                          reinterpret_cast<const uint8_t *>(head_ref.data()),
                          head_ref.size())) return ESP32GIT_IO_ERROR;
   const esp32git_remote anon = {nullptr, nullptr, nullptr};
-  st = e32g::fetch_url(remote_url, branch, workdir, auth ? *auth : anon);
+  st = e32g::fetch_url(remote_url, branch, workdir, auth ? *auth : anon, false);
   if (st != ESP32GIT_OK) return st;
   char head[41];
   st = esp32git_resolve_head(workdir, head);
@@ -685,12 +847,27 @@ esp32git_status esp32git_download_path_url(const char *remote_url,
                                   auth ? *auth : anon);
 }
 
+int esp32git_filter_notes(void *, const char *relpath) {
+  const size_t n = strlen(relpath);
+  return (n >= 3 && strcmp(relpath + n - 3, ".md") == 0) ||
+         (n >= 4 && strcmp(relpath + n - 4, ".txt") == 0);
+}
+
 esp32git_status esp32git_download_missing_notes_url(const char *remote_url,
                                                     const char *repo_path,
                                                     const esp32git_remote *auth) {
   const esp32git_remote anon = {nullptr, nullptr, nullptr};
-  return e32g::download_missing_url(remote_url, repo_path,
-                                    auth ? *auth : anon, true);
+  return e32g::download_matching_url(remote_url, repo_path, auth ? *auth : anon,
+                                     esp32git_filter_notes, nullptr, nullptr, nullptr);
+}
+
+esp32git_status esp32git_download_missing_matching_url(
+    const char *remote_url, const char *repo_path, const esp32git_remote *auth,
+    esp32git_path_filter filter, void *filter_ctx, esp32git_progress_fn progress,
+    void *progress_ctx) {
+  const esp32git_remote anon = {nullptr, nullptr, nullptr};
+  return e32g::download_matching_url(remote_url, repo_path, auth ? *auth : anon, filter,
+                                     filter_ctx, progress, progress_ctx);
 }
 
 esp32git_status esp32git_download_missing_files_url(const char *remote_url,
