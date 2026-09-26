@@ -246,14 +246,8 @@ bool pack_read(const uint8_t *data, size_t len, const std::string &scratch_repo,
         base.assign(loose.data(), loose.data() + loose_len);
         ref_base_type = type; // resolved object keeps the base's type
       }
-      size_t dat = 0;
-      uint64_t src_size = 0;
-      if (!read_delta_size(r.payload.data(), r.payload.size(), dat, src_size) ||
-          src_size != base.size()) {
-        return false;
-      }
-      if (!delta_apply(base.data(), base.size(), r.payload.data() + dat,
-                       r.payload.size() - dat, e.data)) {
+      if (!delta_apply(base.data(), base.size(), r.payload.data(),
+                       r.payload.size(), e.data)) {
         return false;
       }
       // The resolved object keeps its base's type.
@@ -569,20 +563,8 @@ bool pack_read_file(const std::string &path, uint64_t offset, uint64_t len,
       if (base_type == 0) base_type = pack_type_from_name(base_type_name);
       if (base_type == 0) return false;
 
-      size_t delta_at = 0;
-      uint64_t source_size = 0;
-      uint64_t destination_size = 0;
-      if (!read_delta_size(inflated.data(), inflated.size(), delta_at,
-                           source_size) ||
-          source_size != base.size() ||
-          !read_delta_size(inflated.data(), inflated.size(), delta_at,
-                           destination_size) ||
-          destination_size > kMaxObjectBytes) {
-        return false;
-      }
-      if (!delta_apply(base.data(), base.size(),
-                       inflated.data() + delta_at,
-                       inflated.size() - delta_at, resolved)) {
+      if (!delta_apply(base.data(), base.size(), inflated.data(),
+                       inflated.size(), resolved)) {
         return false;
       }
       entry.type = base_type;
@@ -645,6 +627,88 @@ std::vector<uint8_t> pack_write(const std::vector<PackEntry> &entries) {
   esp32git_sha1_final(&ctx, digest);
   out.insert(out.end(), digest, digest + 20);
   return out;
+}
+
+bool pack_extract_blob_file(const std::string &path, uint64_t offset,
+                            uint64_t len, const char expected_sha[41],
+                            const std::string &destination) {
+  const int64_t total = file_size(path);
+  if (total < 0 || offset > (uint64_t)total ||
+      len > (uint64_t)total - offset || len < 33) return false;
+  File pack;
+  if (!pack.open(path, false) || !pack.seek(offset)) return false;
+  uint8_t header[12];
+  if (!read_exact(pack, header, sizeof(header)) ||
+      memcmp(header, "PACK", 4) != 0 ||
+      header[4] != 0 || header[5] != 0 || header[6] != 0 ||
+      (header[7] != 2 && header[7] != 3) ||
+      header[8] != 0 || header[9] != 0 || header[10] != 0 ||
+      header[11] != 1) return false;
+
+  const uint64_t data_end = len - 20;
+  uint64_t at = 12;
+  uint8_t c = 0;
+  if (!read_file_byte(pack, at, data_end, c) || ((c >> 4) & 7) != PACK_BLOB) {
+    return false;
+  }
+  uint64_t expected_size = c & 0x0f;
+  int shift = 4;
+  while (c & 0x80) {
+    if (!read_file_byte(pack, at, data_end, c) || shift >= 64 ||
+        (uint64_t)(c & 0x7f) > (UINT64_MAX >> shift)) return false;
+    expected_size |= (uint64_t)(c & 0x7f) << shift;
+    shift += 7;
+  }
+
+  File output;
+  if (!output.open(destination, true)) return false;
+  auto source_buffer = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[kPackSourceBufferBytes]);
+  auto dictionary = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[32768]);
+  auto chunk = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[4096]);
+  auto d = std::unique_ptr<uzlib_uncomp>(new (std::nothrow) uzlib_uncomp{});
+  if (!source_buffer || !dictionary || !chunk || !d ||
+      !pack.seek(offset + at)) return false;
+
+  FileInflateSource source = {&pack, source_buffer.get(),
+                              kPackSourceBufferBytes, data_end - at, 0};
+  uzlib_uncompress_init(d.get(), dictionary.get(), 32768);
+  d->source = source_buffer.get();
+  d->source_limit = source_buffer.get();
+  d->source_read_cb = read_file_source;
+  d->source_read_context = &source;
+  if (zlib_parse_header(d.get()) != TINF_OK) return false;
+
+  char object_header[48];
+  const int header_len = snprintf(object_header, sizeof(object_header),
+                                  "blob %llu", (unsigned long long)expected_size);
+  if (header_len <= 0 || header_len >= (int)sizeof(object_header)) return false;
+  esp32git_sha1 sha;
+  esp32git_sha1_init(&sha);
+  esp32git_sha1_update(&sha, object_header, (size_t)header_len + 1);
+
+  uint64_t produced = 0;
+  int result = TINF_OK;
+  do {
+    d->dest_start = chunk.get();
+    d->dest = chunk.get();
+    d->dest_limit = chunk.get() + 4096;
+    result = uzlib_uncompress_chksum(d.get());
+    if (result != TINF_OK && result != TINF_DONE) return false;
+    const size_t got = (size_t)(d->dest - chunk.get());
+    if (got > expected_size - produced ||
+        !output.write(chunk.get(), got)) return false;
+    esp32git_sha1_update(&sha, chunk.get(), got);
+    produced += got;
+  } while (result != TINF_DONE);
+  if (!output.close() || produced != expected_size) return false;
+  const uint64_t consumed = source.loaded -
+                            (uint64_t)(d->source_limit - d->source);
+  if (at + consumed != data_end) return false;
+  uint8_t digest[20];
+  char actual_sha[41];
+  esp32git_sha1_final(&sha, digest);
+  esp32git_bytes_to_hex(digest, actual_sha);
+  return strcmp(actual_sha, expected_sha) == 0;
 }
 
 } // namespace e32g

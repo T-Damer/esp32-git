@@ -1,5 +1,6 @@
 #include "io.h"
 
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include <cerrno>
@@ -86,6 +87,37 @@ int stdio_remove(const char *path) {
   return std::remove(path) == 0 || errno == ENOENT ? 0 : -1;
 }
 
+int stdio_rename(const char *from, const char *to) {
+  return std::rename(from, to);
+}
+
+int stdio_list_dir(const char *dir, void (*entry)(void *, const char *, int),
+                   void *ctx) {
+  DIR *handle = opendir(dir);
+  if (!handle) return -1;
+  while (dirent *item = readdir(handle)) {
+    if (strcmp(item->d_name, ".") == 0 || strcmp(item->d_name, "..") == 0) continue;
+    struct stat st;
+    const std::string child = std::string(dir) + "/" + item->d_name;
+    if (stat(child.c_str(), &st) != 0) continue;
+    entry(ctx, item->d_name, S_ISDIR(st.st_mode) ? 1 : 0);
+  }
+  closedir(handle);
+  return 0;
+}
+
+int stdio_stat(const char *path, int64_t *size, int64_t *mtime) {
+  struct stat st;
+  if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+  *size = (int64_t)st.st_size;
+#ifdef __APPLE__
+  *mtime = (int64_t)st.st_mtimespec.tv_sec * 1000000000 + st.st_mtimespec.tv_nsec;
+#else
+  *mtime = (int64_t)st.st_mtim.tv_sec * 1000000000 + st.st_mtim.tv_nsec;
+#endif
+  return 0;
+}
+
 const esp32git_fs_port kStdioPort = {
     stdio_size,
     stdio_read,
@@ -94,7 +126,10 @@ const esp32git_fs_port kStdioPort = {
     stdio_make_dirs,
     {stdio_file_open, stdio_file_read, stdio_file_write, stdio_file_seek,
      stdio_file_close},
-    stdio_remove};
+    stdio_remove,
+    stdio_rename,
+    stdio_list_dir,
+    stdio_stat};
 
 const esp32git_fs_port &p() {
   return active_port ? *active_port : kStdioPort;
@@ -201,6 +236,29 @@ bool remove_file(const std::string &path) {
   if (!fs.remove) return false;
   if (fs.exists && fs.exists(path.c_str()) == 0) return true;
   return fs.remove(path.c_str()) == 0;
+}
+
+bool rename_file(const std::string &from, const std::string &to) {
+  const esp32git_fs_port &fs = p();
+  return fs.rename && fs.rename(from.c_str(), to.c_str()) == 0;
+}
+
+bool can_list_dirs() { return p().list_dir != nullptr; }
+
+bool list_dir(const std::string &dir, std::vector<DirEntry> &out) {
+  out.clear();
+  if (!p().list_dir) return false;
+  return p().list_dir(dir.c_str(),
+                      [](void *ctx, const char *name, int is_dir) {
+                        static_cast<std::vector<DirEntry> *>(ctx)->push_back(
+                            {name, is_dir != 0});
+                      },
+                      &out) == 0;
+}
+
+bool stat_file(const std::string &path, int64_t *size, int64_t *mtime) {
+  if (!p().stat) return false;
+  return p().stat(path.c_str(), size, mtime) == 0;
 }
 
 } // namespace e32g

@@ -55,5 +55,18 @@ bool has_file_io();
 
 // Removes a temporary or regular file. Missing files are treated as success.
 bool remove_file(const std::string &path);
+bool rename_file(const std::string &from, const std::string &to);
+
+struct DirEntry {
+  std::string name;
+  bool is_dir = false;
+};
+
+// Children of dir; false when the backend cannot list directories.
+bool list_dir(const std::string &dir, std::vector<DirEntry> &out);
+bool can_list_dirs();
+
+// Size and modification stamp; false when missing or unsupported.
+bool stat_file(const std::string &path, int64_t *size, int64_t *mtime);
 
 } // namespace e32g

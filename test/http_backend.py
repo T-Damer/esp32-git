@@ -5,15 +5,27 @@ Usage: python3 http_backend.py <port> <project_root_dir>
 """
 
 import os
+import base64
+import hmac
 import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = os.path.abspath(sys.argv[2])
+EXPECTED_AUTH = "Basic " + base64.b64encode(b"x-access-token:local-test-token").decode()
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
+
+    def _authorized(self):
+        if hmac.compare_digest(self.headers.get("Authorization", ""), EXPECTED_AUTH):
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="test git"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
 
     def _run(self, body=None):
         path = self.path.split("?")[0]
@@ -63,10 +75,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        if not self._authorized():
+            return
         print(f"GET {self.path}", flush=True)
         self._run()
 
     def do_POST(self):
+        if not self._authorized():
+            return
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         print(f"POST {self.path} len={length}", flush=True)

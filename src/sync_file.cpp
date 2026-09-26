@@ -1,5 +1,6 @@
 #include "esp32_git.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -9,6 +10,7 @@
 #include "history.h"
 #include "io.h"
 #include "repo.h"
+#include "sha1.h"
 
 namespace {
 
@@ -127,13 +129,100 @@ void ensure_parent_dirs(const std::string &path) {
   e32g::make_dirs(path.substr(0, path.find_last_of('/')));
 }
 
+} // namespace
+
+namespace e32g {
+bool hash_worktree_file(const std::string &path, char out[41]) {
+  const int64_t size = e32g::file_size(path);
+  if (size < 0) return false;
+  e32g::File file;
+  if (!file.open(path, false)) return false;
+  char header[48];
+  const int n = snprintf(header, sizeof(header), "blob %llu",
+                         (unsigned long long)size);
+  if (n <= 0 || n >= (int)sizeof(header)) return false;
+  esp32git_sha1 sha;
+  esp32git_sha1_init(&sha);
+  esp32git_sha1_update(&sha, header, (size_t)n + 1);
+  uint8_t chunk[4096];
+  int64_t remaining = size;
+  while (remaining > 0) {
+    size_t got = 0;
+    const size_t want = remaining < (int64_t)sizeof(chunk)
+                            ? (size_t)remaining : sizeof(chunk);
+    if (!file.read(chunk, want, &got) || got == 0) return false;
+    esp32git_sha1_update(&sha, chunk, got);
+    remaining -= (int64_t)got;
+  }
+  if (!file.close()) return false;
+  uint8_t digest[20];
+  esp32git_sha1_final(&sha, digest);
+  esp32git_bytes_to_hex(digest, out);
+  return true;
+}
+} // namespace e32g
+
+namespace {
+using e32g::hash_worktree_file;
+
+bool old_index_sha(const char *repo_path, const std::string &relpath,
+                   char out[41]) {
+  out[0] = '\0';
+  e32g::File index;
+  if (!index.open(std::string(repo_path) + "/.git/esp32git-index", false)) {
+    return true; // initial clone has no previous index
+  }
+  std::string line;
+  uint8_t chunk[1024];
+  for (;;) {
+    size_t got = 0;
+    if (!index.read(chunk, sizeof(chunk), &got)) return false;
+    if (got == 0) return true;
+    for (size_t i = 0; i < got; ++i) {
+      if (chunk[i] == '\n') {
+        if (line.size() >= 42 && line[40] == ' ' &&
+            line.compare(41, std::string::npos, relpath) == 0) {
+          memcpy(out, line.data(), 40);
+          out[40] = '\0';
+          return true;
+        }
+        line.clear();
+      } else {
+        if (line.size() >= 1024) return false;
+        line.push_back((char)chunk[i]);
+      }
+    }
+  }
+}
+
 // Materializes worktree files and the staging index from a tree id.
-esp32git_status checkout_tree(const char *repo_path, const char *tree_sha) {
+esp32git_status checkout_tree(const char *repo_path, const char *tree_sha,
+                              bool allow_missing = false,
+                              bool preflight = false, bool index_only = false) {
+  if (!preflight && !index_only) {
+    const esp32git_status safe = checkout_tree(repo_path, tree_sha,
+                                               allow_missing, true);
+    if (safe != ESP32GIT_OK) return safe;
+  }
   std::vector<std::pair<std::string, std::string>> pending{{"", tree_sha}};
-  std::vector<esp32git_index_entry> index_entries;
+  // Files of the previous checkout that the new tree no longer has are removed
+  // afterwards, unless they were edited locally.
+  std::vector<esp32git_index_entry> previous;
+  if (!index_only) esp32git_index_load(repo_path, &previous);
+  std::vector<std::string> current_paths;
+  const std::string index_path = std::string(repo_path) + "/.git/esp32git-index";
+  const std::string index_temp = index_path + ".tmp";
+  struct TempCleanup {
+    const std::string &path;
+    ~TempCleanup() { e32g::remove_file(path); }
+  } cleanup{index_temp};
+  e32g::File index_file;
+  if (!preflight && !index_file.open(index_temp, true)) return ESP32GIT_IO_ERROR;
   char type[16];
   static std::vector<char> buf;
   buf.resize(kMaxObjectBytes);
+  static std::vector<uint8_t> content;
+  content.resize(kMaxObjectBytes);
 
   while (!pending.empty()) {
     const auto [prefix, tree] = pending.back();
@@ -158,21 +247,78 @@ esp32git_status checkout_tree(const char *repo_path, const char *tree_sha) {
       if (is_dir) {
         pending.push_back({relpath, hex});
       } else {
-        uint8_t content[kMaxObjectBytes];
+        if (!index_only) current_paths.push_back(relpath);
+        const std::string fp = std::string(repo_path) + "/" + relpath;
+        if (preflight) {
+          if (e32g::exists(fp)) {
+            char current[41], previous[41];
+            if (!hash_worktree_file(fp, current)) return ESP32GIT_IO_ERROR;
+            if (strcmp(current, hex) != 0) {
+              if (!old_index_sha(repo_path, relpath, previous)) return ESP32GIT_IO_ERROR;
+              if (strcmp(current, previous) != 0) return ESP32GIT_REMOTE_DIVERGED;
+            }
+          }
+          q = nul + 21;
+          continue;
+        }
+        const std::string record = std::string(hex) + " " + relpath + "\n";
+        if (!index_file.write(reinterpret_cast<const uint8_t *>(record.data()),
+                              record.size())) return ESP32GIT_IO_ERROR;
+        if (index_only) {
+          q = nul + 21;
+          continue;
+        }
+        char object_path[576];
+        if (allow_missing && !esp32git_object_path(repo_path, hex, object_path,
+                                                   sizeof(object_path))) {
+          if (e32g::exists(fp)) {
+            char current[41];
+            if (!hash_worktree_file(fp, current)) return ESP32GIT_IO_ERROR;
+            if (strcmp(current, hex) != 0 && !e32g::remove_file(fp)) {
+              return ESP32GIT_IO_ERROR;
+            }
+          }
+          q = nul + 21;
+          continue;
+        }
+        if (e32g::exists(fp)) {
+          char current[41];
+          if (!hash_worktree_file(fp, current)) return ESP32GIT_IO_ERROR;
+          if (strcmp(current, hex) == 0) {
+            q = nul + 21;
+            continue;
+          }
+        }
         size_t blen = 0;
-        if (esp32git_object_read(repo_path, hex, type, sizeof(type), content,
-                                 sizeof(content), &blen) != ESP32GIT_OK) {
+        if (esp32git_object_read(repo_path, hex, type, sizeof(type),
+                                 content.data(), content.size(), &blen) != ESP32GIT_OK) {
           return ESP32GIT_IO_ERROR;
         }
-        const std::string fp = std::string(repo_path) + "/" + relpath;
         ensure_parent_dirs(fp);
-        if (!e32g::write_whole(fp, content, blen)) return ESP32GIT_IO_ERROR;
-        index_entries.push_back({relpath, hex});
+        if (!e32g::write_whole(fp, content.data(), blen)) return ESP32GIT_IO_ERROR;
       }
       q = nul + 21;
     }
   }
-  return esp32git_index_save(repo_path, index_entries);
+  std::sort(current_paths.begin(), current_paths.end());
+  for (const auto &old : previous) {
+    if (old.sha.empty() || std::binary_search(current_paths.begin(), current_paths.end(), old.path)) continue;
+    const std::string fp = std::string(repo_path) + "/" + old.path;
+    if (!e32g::exists(fp)) continue;
+    char current[41];
+    if (!hash_worktree_file(fp, current)) return ESP32GIT_IO_ERROR;
+    const bool edited = old.sha != current;
+    if (preflight) {
+      if (edited) return ESP32GIT_REMOTE_DIVERGED;
+    } else if (!edited && !e32g::remove_file(fp)) {
+      return ESP32GIT_IO_ERROR;
+    }
+  }
+  if (preflight) return ESP32GIT_OK;
+  if (!index_file.close() || !e32g::rename_file(index_temp, index_path)) {
+    return ESP32GIT_IO_ERROR;
+  }
+  return ESP32GIT_OK;
 }
 
 // Refreshes the worktree + staging index at a commit id. Shared with the
@@ -194,6 +340,13 @@ esp32git_status e32g_checkout_tree_at(const char *repo_path, const char *tree_sh
 namespace e32g {
 esp32git_status checkout_tree_at(const char *repo_path, const char *tree_sha) {
   return checkout_tree(repo_path, tree_sha);
+}
+esp32git_status checkout_tree_partial_at(const char *repo_path,
+                                         const char *tree_sha) {
+  return checkout_tree(repo_path, tree_sha, true);
+}
+esp32git_status index_from_tree(const char *repo_path, const char *tree_sha) {
+  return checkout_tree(repo_path, tree_sha, true, false, true);
 }
 } // namespace e32g
 
